@@ -1,0 +1,4 @@
+interface:
+  display_name: "PS1 Development and EXE Release Gate"
+  short_description: "Verify through PS1 and ask before rebuilding the EXE"
+  default_prompt: "Use $project-ps1-release-gate to develop and verify this project, then ask before rebuilding the EXE."

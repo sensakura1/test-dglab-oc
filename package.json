@@ -1,0 +1,16 @@
+{
+  "name": "oc-writing-focus-coyote",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local OC writing focus helper with configurable Coyote device triggers.",
+  "scripts": {
+    "start": "npm run desktop",
+    "build:desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
+    "desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File src\\desktop\\OCWritingFocusApp.Wpf.ps1",
+    "test": "node --test tests/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
