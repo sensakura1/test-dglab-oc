@@ -585,6 +585,7 @@ $xaml = @"
                 <StackPanel Grid.Column="1" Margin="0,0,8,10">
                   <TextBlock Text="接口地址 / 12 位蓝牙地址" Foreground="{StaticResource Muted}"/>
                   <TextBox x:Name="EndpointInput" Text="http://127.0.0.1:8080"/>
+                  <TextBlock Text="蓝牙模式：在 Windows 设置 → 蓝牙和设备 → 设备中打开设备详情，查看“蓝牙地址”；填写 12 位十六进制字符，例如 001A7DDA7113。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Column="2" Margin="0,0,8,10">
                   <TextBlock Text="A 软上限（0–200）" Foreground="{StaticResource Muted}"/>
