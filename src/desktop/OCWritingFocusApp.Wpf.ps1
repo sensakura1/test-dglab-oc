@@ -8,9 +8,11 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 
@@ -63,6 +65,7 @@ public sealed class LocalDglabSocketServer : IDisposable
     private TcpClient appClient;
     private NetworkStream appStream;
     private Thread acceptThread;
+    private Timer safetyTimer;
     private volatile bool stopping;
 
     public string ClientId { get; private set; }
@@ -70,13 +73,22 @@ public sealed class LocalDglabSocketServer : IDisposable
     public string LastError { get; private set; }
     public bool IsRunning { get; private set; }
     public bool IsBound { get; private set; }
+    public bool HasAppLimits { get; private set; }
+    public int AppStrengthA { get; private set; }
+    public int AppStrengthB { get; private set; }
+    public int AppLimitA { get; private set; }
+    public int AppLimitB { get; private set; }
+    public int StrengthUpdateCount { get; private set; }
     public int Port { get; private set; }
+    public int WatchdogStopCount { get { return watchdogStopCount; } }
+    public bool LastWatchdogStopSucceeded { get; private set; }
 
     public LocalDglabSocketServer()
     {
         ClientId = Guid.NewGuid().ToString();
         TargetId = "";
         LastError = "";
+        LastWatchdogStopSucceeded = true;
     }
 
     public void Start(int port)
@@ -118,6 +130,15 @@ public sealed class LocalDglabSocketServer : IDisposable
         {
             NetworkStream stream = client.GetStream();
             string request = ReadHttpRequest(stream);
+            string[] requestLines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
+            string expectedRequestLine = "GET /" + ClientId + " HTTP/1.1";
+            if (requestLines.Length == 0 || !string.Equals(requestLines[0], expectedRequestLine, StringComparison.Ordinal))
+                throw new InvalidDataException("Invalid WebSocket registration path.");
+            string upgrade = GetHeader(request, "Upgrade");
+            string connection = GetHeader(request, "Connection");
+            if (!string.Equals(upgrade, "websocket", StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(connection) || connection.IndexOf("Upgrade", StringComparison.OrdinalIgnoreCase) < 0)
+                throw new InvalidDataException("Invalid WebSocket upgrade request.");
             string key = GetHeader(request, "Sec-WebSocket-Key");
             if (string.IsNullOrWhiteSpace(key)) throw new InvalidDataException("Missing Sec-WebSocket-Key.");
             string accept;
@@ -134,9 +155,12 @@ public sealed class LocalDglabSocketServer : IDisposable
             {
                 if (appClient != null) { try { appClient.Close(); } catch { } }
                 appClient = client;
+                appClient.SendTimeout = 1000;
+                appClient.ReceiveTimeout = 5000;
                 appStream = stream;
                 TargetId = Guid.NewGuid().ToString();
                 IsBound = false;
+                HasAppLimits = false;
             }
 
             SendEnvelope("bind", TargetId, "", "targetId");
@@ -161,6 +185,7 @@ public sealed class LocalDglabSocketServer : IDisposable
                     appStream = null;
                     TargetId = "";
                     IsBound = false;
+                    HasAppLimits = false;
                 }
             }
             try { client.Close(); } catch { }
@@ -184,6 +209,26 @@ public sealed class LocalDglabSocketServer : IDisposable
             IsBound = true;
             SendEnvelope("bind", ClientId, TargetId, "200");
         }
+        else if (type == "msg" && IsBound && clientId == TargetId && targetId == ClientId)
+        {
+            Match strength = Regex.Match(body ?? "", @"^strength-(\d{1,3})\+(\d{1,3})\+(\d{1,3})\+(\d{1,3})$", RegexOptions.IgnoreCase);
+            if (strength.Success)
+            {
+                int a = Math.Min(200, Int32.Parse(strength.Groups[1].Value));
+                int b = Math.Min(200, Int32.Parse(strength.Groups[2].Value));
+                int limitA = Math.Min(200, Int32.Parse(strength.Groups[3].Value));
+                int limitB = Math.Min(200, Int32.Parse(strength.Groups[4].Value));
+                lock (sync)
+                {
+                    AppStrengthA = a;
+                    AppStrengthB = b;
+                    AppLimitA = limitA;
+                    AppLimitB = limitB;
+                    HasAppLimits = true;
+                    StrengthUpdateCount++;
+                }
+            }
+        }
     }
 
     public void SendCommand(string command)
@@ -191,6 +236,49 @@ public sealed class LocalDglabSocketServer : IDisposable
         if (!IsBound || string.IsNullOrEmpty(TargetId)) throw new InvalidOperationException("DG-Lab App is not bound.");
         SendEnvelope("msg", ClientId, TargetId, command);
     }
+
+    public bool StopOutputReliable(int attempts)
+    {
+        string[] commands = new[] { "strength-1+2+0", "strength-2+2+0", "clear-1", "clear-2" };
+        bool[] sent = new bool[commands.Length];
+        int rounds = Math.Max(1, attempts);
+        for (int round = 0; round < rounds; round++)
+        {
+            for (int i = 0; i < commands.Length; i++)
+            {
+                if (sent[i]) continue;
+                try { SendCommand(commands[i]); sent[i] = true; }
+                catch (Exception ex) { LastError = ex.Message; }
+            }
+            if (Array.TrueForAll(sent, value => value)) return true;
+            Thread.Sleep(50);
+        }
+        return Array.TrueForAll(sent, value => value);
+    }
+
+    public void ArmSafetyTimeout(int milliseconds)
+    {
+        int due = Math.Max(100, milliseconds);
+        lock (sync)
+        {
+            if (safetyTimer == null) safetyTimer = new Timer(SafetyTimeoutElapsed, null, Timeout.Infinite, Timeout.Infinite);
+            safetyTimer.Change(due, Timeout.Infinite);
+        }
+    }
+
+    public void CancelSafetyTimeout()
+    {
+        lock (sync) { if (safetyTimer != null) safetyTimer.Change(Timeout.Infinite, Timeout.Infinite); }
+    }
+
+    private void SafetyTimeoutElapsed(object state)
+    {
+        bool stopped = StopOutputReliable(3);
+        LastWatchdogStopSucceeded = stopped;
+        Interlocked.Increment(ref watchdogStopCount);
+    }
+
+    private int watchdogStopCount;
 
     private void SendEnvelope(string type, string clientId, string targetId, string message)
     {
@@ -241,6 +329,7 @@ public sealed class LocalDglabSocketServer : IDisposable
         if (second < 0) return null;
         int opcode = first & 0x0F;
         bool masked = (second & 0x80) != 0;
+        if (!masked) throw new InvalidDataException("Client WebSocket frames must be masked.");
         ulong length = (ulong)(second & 0x7F);
         if (length == 126) length = (ulong)((stream.ReadByte() << 8) | stream.ReadByte());
         else if (length == 127)
@@ -299,6 +388,7 @@ public sealed class LocalDglabSocketServer : IDisposable
         try { if (listener != null) listener.Stop(); } catch { }
         lock (sync)
         {
+            if (safetyTimer != null) { safetyTimer.Dispose(); safetyTimer = null; }
             try { if (appClient != null) appClient.Close(); } catch { }
             appClient = null;
             appStream = null;
@@ -306,6 +396,105 @@ public sealed class LocalDglabSocketServer : IDisposable
     }
 
     public void Dispose() { Stop(); }
+}
+
+public sealed class DglabRemoteSocketTransport : IDisposable
+{
+    private readonly object sync = new object();
+    private readonly ClientWebSocket socket;
+    private readonly JavaScriptSerializer json = new JavaScriptSerializer();
+    private Timer safetyTimer;
+    private int watchdogStopCount;
+    private string clientId = "";
+    private string targetId = "";
+
+    public string LastError { get; private set; }
+    public int WatchdogStopCount { get { return watchdogStopCount; } }
+    public bool LastWatchdogStopSucceeded { get; private set; }
+
+    public DglabRemoteSocketTransport(ClientWebSocket socket)
+    {
+        if (socket == null) throw new ArgumentNullException("socket");
+        this.socket = socket;
+        LastError = "";
+        LastWatchdogStopSucceeded = true;
+    }
+
+    public void UpdateBinding(string clientId, string targetId)
+    {
+        lock (sync)
+        {
+            this.clientId = clientId ?? "";
+            this.targetId = targetId ?? "";
+        }
+    }
+
+    public void SendCommand(string command)
+    {
+        lock (sync)
+        {
+            if (socket.State != WebSocketState.Open) throw new InvalidOperationException("Socket is not open.");
+            if (string.IsNullOrEmpty(clientId) || string.IsNullOrEmpty(targetId)) throw new InvalidOperationException("DG-Lab App is not bound.");
+            string payload = json.Serialize(new Dictionary<string, object>
+            {
+                { "type", "msg" }, { "clientId", clientId }, { "targetId", targetId }, { "message", command }
+            });
+            byte[] bytes = Encoding.UTF8.GetBytes(payload);
+            using (CancellationTokenSource timeout = new CancellationTokenSource(1000))
+            {
+                socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeout.Token).GetAwaiter().GetResult();
+            }
+        }
+    }
+
+    public bool StopOutputReliable(int attempts)
+    {
+        string[] commands = new[] { "strength-1+2+0", "strength-2+2+0", "clear-1", "clear-2" };
+        bool[] sent = new bool[commands.Length];
+        int rounds = Math.Max(1, attempts);
+        for (int round = 0; round < rounds; round++)
+        {
+            for (int i = 0; i < commands.Length; i++)
+            {
+                if (sent[i]) continue;
+                try { SendCommand(commands[i]); sent[i] = true; }
+                catch (Exception ex) { LastError = ex.Message; }
+            }
+            if (Array.TrueForAll(sent, value => value)) return true;
+            Thread.Sleep(50);
+        }
+        return Array.TrueForAll(sent, value => value);
+    }
+
+    public void ArmSafetyTimeout(int milliseconds)
+    {
+        int due = Math.Max(100, milliseconds);
+        lock (sync)
+        {
+            if (safetyTimer == null) safetyTimer = new Timer(SafetyTimeoutElapsed, null, Timeout.Infinite, Timeout.Infinite);
+            safetyTimer.Change(due, Timeout.Infinite);
+        }
+    }
+
+    public void CancelSafetyTimeout()
+    {
+        lock (sync) { if (safetyTimer != null) safetyTimer.Change(Timeout.Infinite, Timeout.Infinite); }
+    }
+
+    private void SafetyTimeoutElapsed(object state)
+    {
+        bool stopped = StopOutputReliable(3);
+        LastWatchdogStopSucceeded = stopped;
+        Interlocked.Increment(ref watchdogStopCount);
+    }
+
+    public void Dispose()
+    {
+        lock (sync)
+        {
+            if (safetyTimer != null) { safetyTimer.Dispose(); safetyTimer = null; }
+        }
+    }
 }
 "@
 
@@ -587,6 +776,12 @@ $xaml = @"
             <TextBlock x:Name="PageTitleValue" Text="控制台" FontSize="22" FontWeight="Bold" Margin="0,2,0,0"/>
           </StackPanel>
           <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+             <Border Background="#303030" BorderBrush="#5A5A5A" BorderThickness="1" CornerRadius="3" Padding="10,4" Margin="0,0,8,0">
+               <StackPanel>
+                 <TextBlock x:Name="ActualStrengthValue" Text="A --  |  B --" Foreground="White" FontWeight="Bold" FontSize="13" HorizontalAlignment="Center"/>
+                 <TextBlock x:Name="ActualStrengthSource" Text="未连接" Foreground="{StaticResource Muted}" FontSize="9" HorizontalAlignment="Center"/>
+               </StackPanel>
+             </Border>
              <Border Background="#25384A" CornerRadius="3" Padding="10,5" Margin="0,0,8,0">
               <TextBlock x:Name="DeviceBadge" Text="HTTP 桥接" Foreground="#66B3FF" FontWeight="Bold"/>
             </Border>
@@ -711,6 +906,7 @@ $xaml = @"
                   <RowDefinition Height="Auto"/>
                   <RowDefinition Height="Auto"/>
                   <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <StackPanel Margin="0,0,8,10">
                   <TextBlock Text="专注时长（分钟）" Foreground="{StaticResource Muted}"/>
@@ -741,6 +937,14 @@ $xaml = @"
                 <StackPanel Grid.Row="2" Grid.Column="1">
                   <TextBlock Text="黑名单策略" Foreground="{StaticResource Muted}"/>
                   <TextBox Text="命中立即触发" IsReadOnly="True"/>
+                </StackPanel>
+                <StackPanel Grid.Row="3" Margin="0,10,8,0">
+                  <TextBlock Text="持续模式最长输出（秒，1–30）" Foreground="{StaticResource Muted}"/>
+                  <TextBox x:Name="MaxContinuousInput" Text="10"/>
+                </StackPanel>
+                <StackPanel Grid.Row="3" Grid.Column="1" Margin="0,10,0,0">
+                  <TextBlock Text="持续模式冷却时间（秒，5–3600）" Foreground="{StaticResource Muted}"/>
+                  <TextBox x:Name="HoldCooldownInput" Text="60"/>
                 </StackPanel>
               </Grid>
             </StackPanel>
@@ -795,8 +999,8 @@ $xaml = @"
                   <TextBox x:Name="WaveIntensityInput" Text="35"/>
                 </StackPanel>
                 <StackPanel Grid.Row="2" Margin="0,0,8,0">
-                  <TextBlock Text="固定持续时间 ms" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="DurationInput" Text="5000"/>
+                  <TextBlock Text="固定持续时间（秒，1–30）" Foreground="{StaticResource Muted}"/>
+                  <TextBox x:Name="DurationInput" Text="5"/>
                 </StackPanel>
                 <Border Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2" Background="#303030" CornerRadius="3" Padding="10">
                   <TextBlock Text="安全说明：通道强度受下方 BF 软上限二次限制；急停会立即将 A/B 强度归零。" Foreground="{StaticResource Muted}" TextWrapping="Wrap"/>
@@ -813,8 +1017,8 @@ $xaml = @"
                   <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <StackPanel>
-                  <TextBlock Text="V3 设备、安全上限与平衡参数" FontSize="18" FontWeight="Bold"/>
-                  <TextBlock Text="BF 参数会在每次蓝牙重连后重新写入；设备会断电保存，修改前请确认安全范围。" Foreground="{StaticResource Muted}" Margin="0,4,0,0"/>
+                  <TextBlock Text="设备连接与强度安全上限" FontSize="18" FontWeight="Bold"/>
+                  <TextBlock Text="Socket 使用 App 上报上限；蓝牙和 HTTP 使用本页手动上限。蓝牙 BF 参数会在每次重连后重新写入。" Foreground="{StaticResource Muted}" Margin="0,4,0,0"/>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal">
                   <Border Background="#303030" CornerRadius="3" Padding="12,8">
@@ -839,6 +1043,11 @@ $xaml = @"
                     <TextBlock Text="桥接服务地址" Foreground="{StaticResource Muted}" Margin="0,8,0,0"/>
                     <TextBox x:Name="HttpEndpointInput" Text="http://127.0.0.1:8080"/>
                     <TextBlock Text="填写本地或远程 HTTP 桥接服务地址，连接时会访问 /status。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                    <Grid Margin="0,8,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                      <StackPanel Margin="0,0,8,0"><TextBlock Text="A 手动上限（0–200）" Foreground="{StaticResource Muted}"/><TextBox x:Name="HttpLimitAInput" Text="80"/></StackPanel>
+                      <StackPanel Grid.Column="1"><TextBlock Text="B 手动上限（0–200）" Foreground="{StaticResource Muted}"/><TextBox x:Name="HttpLimitBInput" Text="80"/></StackPanel>
+                    </Grid>
                   </StackPanel>
                 </Border>
 
@@ -891,6 +1100,8 @@ $xaml = @"
                       <TextBlock Text="本地模式会监听所有网卡；请填写手机可访问的本机地址，并在 Windows 防火墙中允许该端口。启动后，用 DG-Lab App 扫描右侧二维码或手动填写生成的地址。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8"/>
                       <TextBlock Text="绑定状态" Foreground="{StaticResource Muted}"/>
                       <TextBlock x:Name="SocketBindStatusText" Text="未连接服务器" FontWeight="Bold" Margin="0,2,0,8"/>
+                      <TextBlock Text="App 当前强度 / 上限" Foreground="{StaticResource Muted}"/>
+                      <TextBlock x:Name="SocketAppLimitsText" Text="等待 App 上报 A/B 强度上限；未上报前禁止输出" FontWeight="Bold" TextWrapping="Wrap" Margin="0,2,0,8"/>
                       <TextBlock Text="App 手动连接地址" Foreground="{StaticResource Muted}"/>
                       <TextBox x:Name="SocketManualAddressText" IsReadOnly="True" Margin="0,2,0,8"/>
                       <TextBlock Text="二维码内容（可复制）" Foreground="{StaticResource Muted}"/>
@@ -960,6 +1171,17 @@ $xaml = @"
             </StackPanel>
 
             <StackPanel x:Name="LogsPanel" Grid.Column="1">
+              <Border Background="#303030" CornerRadius="3" Padding="12" Margin="0,0,0,14">
+                <StackPanel>
+                  <TextBlock Text="配置管理" FontSize="16" FontWeight="Bold"/>
+                  <TextBlock Text="导入会先停止当前输出并断开 Socket；配置文件使用版本化 JSON 格式。" Foreground="{StaticResource Muted}" TextWrapping="Wrap" Margin="0,4,0,10"/>
+                  <WrapPanel>
+                    <Button x:Name="ImportConfigButton" Style="{StaticResource SecondaryButton}" Content="导入配置" Width="96" Margin="0,0,8,0"/>
+                    <Button x:Name="ExportConfigButton" Style="{StaticResource SecondaryButton}" Content="导出配置" Width="96" Margin="0,0,8,0"/>
+                    <Button x:Name="ResetSafeConfigButton" Style="{StaticResource DangerButton}" Content="恢复安全默认值" Width="130"/>
+                  </WrapPanel>
+                </StackPanel>
+              </Border>
               <Grid>
                 <Grid.ColumnDefinitions>
                   <ColumnDefinition Width="*"/>
@@ -1010,6 +1232,8 @@ $DistractionValue = Find-Control "DistractionValue"
 $IdleValue = Find-Control "IdleValue"
 $DeviceValue = Find-Control "DeviceValue"
 $DeviceBadge = Find-Control "DeviceBadge"
+$ActualStrengthValue = Find-Control "ActualStrengthValue"
+$ActualStrengthSource = Find-Control "ActualStrengthSource"
 $LockBadge = Find-Control "LockBadge"
 $LockBadgeBorder = Find-Control "LockBadgeBorder"
 $DeviceModeCombo = Find-Control "DeviceModeCombo"
@@ -1017,6 +1241,8 @@ $HttpConnectionPage = Find-Control "HttpConnectionPage"
 $BleConnectionPage = Find-Control "BleConnectionPage"
 $SocketConnectionPage = Find-Control "SocketConnectionPage"
 $HttpEndpointInput = Find-Control "HttpEndpointInput"
+$HttpLimitAInput = Find-Control "HttpLimitAInput"
+$HttpLimitBInput = Find-Control "HttpLimitBInput"
 $BleAddressInput = Find-Control "BleAddressInput"
 $SocketServerModeCombo = Find-Control "SocketServerModeCombo"
 $LocalSocketSettings = Find-Control "LocalSocketSettings"
@@ -1025,6 +1251,7 @@ $LocalSocketHostInput = Find-Control "LocalSocketHostInput"
 $LocalSocketPortInput = Find-Control "LocalSocketPortInput"
 $SocketServerInput = Find-Control "SocketServerInput"
 $SocketBindStatusText = Find-Control "SocketBindStatusText"
+$SocketAppLimitsText = Find-Control "SocketAppLimitsText"
 $SocketManualAddressText = Find-Control "SocketManualAddressText"
 $SocketQrContentText = Find-Control "SocketQrContentText"
 $SocketQrImage = Find-Control "SocketQrImage"
@@ -1051,6 +1278,8 @@ $WaveformCombo = Find-Control "WaveformCombo"
 $WavePeriodInput = Find-Control "WavePeriodInput"
 $WaveIntensityInput = Find-Control "WaveIntensityInput"
 $DurationInput = Find-Control "DurationInput"
+$MaxContinuousInput = Find-Control "MaxContinuousInput"
+$HoldCooldownInput = Find-Control "HoldCooldownInput"
 $SoftLimitAInput = Find-Control "SoftLimitAInput"
 $SoftLimitBInput = Find-Control "SoftLimitBInput"
 $FrequencyBalanceAInput = Find-Control "FrequencyBalanceAInput"
@@ -1070,6 +1299,9 @@ $ApplySafetyButton = Find-Control "ApplySafetyButton"
 $DisconnectButton = Find-Control "DisconnectButton"
 $StopButton = Find-Control "StopButton"
 $ClearLogsButton = Find-Control "ClearLogsButton"
+$ImportConfigButton = Find-Control "ImportConfigButton"
+$ExportConfigButton = Find-Control "ExportConfigButton"
+$ResetSafeConfigButton = Find-Control "ResetSafeConfigButton"
 
 $script:State = @{
   Running = $false
@@ -1091,8 +1323,15 @@ $script:State = @{
   OutputHoldUntilWhitelist = $false
   OutputProfile = $null
   OutputEnd = [DateTime]::MinValue
+  ActualStrengthKnown = $false
+  ActualStrengthA = 0
+  ActualStrengthB = 0
+  ActualStrengthSource = "未连接"
+  HoldRetriggerPending = $false
+  HoldCooldownEnd = [DateTime]::MinValue
   HttpRenewAt = [DateTime]::MinValue
   SocketClient = $null
+  SocketTransport = $null
   SocketClientId = ""
   SocketTargetId = ""
   SocketServerUri = ""
@@ -1100,6 +1339,13 @@ $script:State = @{
   SocketReceiveBuffer = $null
   LocalSocketServer = $null
   LocalSocketLastError = ""
+  SocketWatchdogStopCount = 0
+  SocketAppStrengthA = 0
+  SocketAppStrengthB = 0
+  SocketAppLimitA = 0
+  SocketAppLimitB = 0
+  SocketHasAppLimits = $false
+  SocketStrengthUpdateCount = 0
   SocketServerMode = "local"
 }
 
@@ -1128,6 +1374,278 @@ function Add-Log($Message) {
   while ($LogList.Items.Count -gt 80) {
     $LogList.Items.RemoveAt($LogList.Items.Count - 1)
   }
+}
+
+function Set-ActualStrengthState([int]$StrengthA, [int]$StrengthB, [string]$Source, [bool]$Known = $true) {
+  $script:State.ActualStrengthKnown = $Known
+  $script:State.ActualStrengthA = [Math]::Max(0, [Math]::Min(200, $StrengthA))
+  $script:State.ActualStrengthB = [Math]::Max(0, [Math]::Min(200, $StrengthB))
+  $script:State.ActualStrengthSource = if ([string]::IsNullOrWhiteSpace($Source)) { "未知来源" } else { $Source }
+  if ($Known) {
+    $ActualStrengthValue.Text = "A $($script:State.ActualStrengthA)  |  B $($script:State.ActualStrengthB)"
+  } else {
+    $ActualStrengthValue.Text = "A --  |  B --"
+  }
+  $ActualStrengthSource.Text = $script:State.ActualStrengthSource
+}
+
+function Get-RequiredConfigValue($Object, [string]$Name) {
+  if ($null -eq $Object -or $Object.PSObject.Properties.Name -notcontains $Name) {
+    throw "配置缺少字段：$Name"
+  }
+  return $Object.$Name
+}
+
+function ConvertTo-ConfigInt($Value, [string]$Name, [int]$Minimum, [int]$Maximum) {
+  $parsed = 0
+  if (-not [int]::TryParse([string]$Value, [ref]$parsed)) {
+    throw "配置字段 $Name 必须是整数。"
+  }
+  if ($parsed -lt $Minimum -or $parsed -gt $Maximum) {
+    throw "配置字段 $Name 必须在 $Minimum 至 $Maximum 之间。"
+  }
+  return $parsed
+}
+
+function ConvertTo-ConfigText($Value, [string]$Name, [int]$MaximumLength, [switch]$AllowEmpty) {
+  $text = [string]$Value
+  if (-not $AllowEmpty -and [string]::IsNullOrWhiteSpace($text)) {
+    throw "配置字段 $Name 不能为空。"
+  }
+  if ($text.Length -gt $MaximumLength) {
+    throw "配置字段 $Name 超过最大长度 $MaximumLength。"
+  }
+  return $text.Trim()
+}
+
+function ConvertTo-ConfigChoice($Value, [string]$Name, [string[]]$Choices) {
+  $text = [string]$Value
+  if ($text -notin $Choices) {
+    throw "配置字段 $Name 的值无效：$text"
+  }
+  return $text
+}
+
+function Get-DesktopConfiguration {
+  $rangeA = Get-NumericRange $StrengthARangeInput 40 60 200
+  $rangeB = Get-NumericRange $StrengthBRangeInput 40 60 200
+  return [ordered]@{
+    schemaVersion = 2
+    focus = [ordered]@{
+      sessionMinutes = Get-ClampedInt $FocusMinutesInput 45 1 10080
+      leaveSeconds = Get-ClampedInt $LeaveInput 300 1 86400
+      idleSeconds = Get-ClampedInt $IdleInput 600 1 86400
+    }
+    trigger = [ordered]@{
+      outputMode = @("untilWhitelist", "fixedDuration")[[Math]::Max(0, [Math]::Min(1, $OutputModeCombo.SelectedIndex))]
+      overlapMode = @("restart", "extend")[[Math]::Max(0, [Math]::Min(1, $OverlapModeCombo.SelectedIndex))]
+      channel = @("both", "A", "B")[[Math]::Max(0, [Math]::Min(2, $ChannelModeCombo.SelectedIndex))]
+      strengthA = @($rangeA[0], $rangeA[1])
+      strengthB = @($rangeB[0], $rangeB[1])
+      waveform = @("constant", "pulse", "ramp", "heartbeat")[[Math]::Max(0, [Math]::Min(3, $WaveformCombo.SelectedIndex))]
+      wavePeriodMs = Get-ClampedInt $WavePeriodInput 30 10 1000
+      waveIntensity = Get-ClampedInt $WaveIntensityInput 35 0 100
+      durationSeconds = Get-ClampedInt $DurationInput 5 1 30
+      maxContinuousSeconds = Get-ClampedInt $MaxContinuousInput 10 1 30
+      cooldownSeconds = Get-ClampedInt $HoldCooldownInput 60 5 3600
+    }
+    device = [ordered]@{
+      mode = @("http", "ble", "socket")[[Math]::Max(0, [Math]::Min(2, $DeviceModeCombo.SelectedIndex))]
+      httpEndpoint = $HttpEndpointInput.Text.Trim()
+      bleAddress = $BleAddressInput.Text.Trim()
+      socket = [ordered]@{
+        mode = @("local", "remote")[[Math]::Max(0, [Math]::Min(1, $SocketServerModeCombo.SelectedIndex))]
+        localHost = $LocalSocketHostInput.Text.Trim()
+        localPort = Get-ClampedInt $LocalSocketPortInput 5678 1 65535
+        remoteServer = $SocketServerInput.Text.Trim()
+      }
+    }
+    safety = [ordered]@{
+      httpLimitA = Get-ClampedInt $HttpLimitAInput 80 0 200
+      httpLimitB = Get-ClampedInt $HttpLimitBInput 80 0 200
+      softLimitA = Get-ClampedInt $SoftLimitAInput 80 0 200
+      softLimitB = Get-ClampedInt $SoftLimitBInput 80 0 200
+      frequencyBalanceA = Get-ClampedInt $FrequencyBalanceAInput 0 0 255
+      frequencyBalanceB = Get-ClampedInt $FrequencyBalanceBInput 0 0 255
+      strengthBalanceA = Get-ClampedInt $StrengthBalanceAInput 0 0 255
+      strengthBalanceB = Get-ClampedInt $StrengthBalanceBInput 0 0 255
+    }
+    scope = [ordered]@{
+      whitelist = @($WhitelistList.Items | ForEach-Object { [string]$_ })
+      blacklist = @($BlacklistList.Items | ForEach-Object { [string]$_ })
+    }
+  }
+}
+
+function Get-SafeDesktopConfiguration {
+  return [pscustomobject]@{
+    schemaVersion = 2
+    focus = [pscustomobject]@{ sessionMinutes = 45; leaveSeconds = 300; idleSeconds = 600 }
+    trigger = [pscustomobject]@{
+      outputMode = "fixedDuration"; overlapMode = "restart"; channel = "both"
+      strengthA = @(10, 20); strengthB = @(10, 20); waveform = "constant"
+      wavePeriodMs = 30; waveIntensity = 20; durationSeconds = 1
+      maxContinuousSeconds = 10; cooldownSeconds = 60
+    }
+    device = [pscustomobject]@{
+      mode = "http"; httpEndpoint = "http://127.0.0.1:8080"; bleAddress = ""
+      socket = [pscustomobject]@{ mode = "local"; localHost = (Get-PreferredLocalIpv4Address); localPort = 5678; remoteServer = "ws://192.168.1.100:5678" }
+    }
+    safety = [pscustomobject]@{
+      httpLimitA = 30; httpLimitB = 30; softLimitA = 30; softLimitB = 30; frequencyBalanceA = 0; frequencyBalanceB = 0
+      strengthBalanceA = 0; strengthBalanceB = 0
+    }
+    scope = [pscustomobject]@{ whitelist = @(); blacklist = @() }
+  }
+}
+
+function Stop-ForConfigurationChange {
+  if ($script:State.OutputActive -or $script:Ble.OutputActive) {
+    Invoke-DeviceStop | Out-Null
+  }
+  if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) {
+    Reset-SocketConnection
+  }
+  $script:State.Connected = $false
+}
+
+function Set-DesktopConfiguration($Config, [string]$SourceName) {
+  $version = ConvertTo-ConfigInt (Get-RequiredConfigValue $Config "schemaVersion") "schemaVersion" 1 2
+  $focus = Get-RequiredConfigValue $Config "focus"
+  $trigger = Get-RequiredConfigValue $Config "trigger"
+  $device = Get-RequiredConfigValue $Config "device"
+  $socket = Get-RequiredConfigValue $device "socket"
+  $safety = Get-RequiredConfigValue $Config "safety"
+  $scope = Get-RequiredConfigValue $Config "scope"
+
+  $sessionMinutes = ConvertTo-ConfigInt (Get-RequiredConfigValue $focus "sessionMinutes") "focus.sessionMinutes" 1 10080
+  $leaveSeconds = ConvertTo-ConfigInt (Get-RequiredConfigValue $focus "leaveSeconds") "focus.leaveSeconds" 1 86400
+  $idleSeconds = ConvertTo-ConfigInt (Get-RequiredConfigValue $focus "idleSeconds") "focus.idleSeconds" 1 86400
+  $outputMode = ConvertTo-ConfigChoice (Get-RequiredConfigValue $trigger "outputMode") "trigger.outputMode" @("untilWhitelist", "fixedDuration")
+  $overlapMode = ConvertTo-ConfigChoice (Get-RequiredConfigValue $trigger "overlapMode") "trigger.overlapMode" @("restart", "extend")
+  $channel = ConvertTo-ConfigChoice (Get-RequiredConfigValue $trigger "channel") "trigger.channel" @("both", "A", "B")
+  $waveform = ConvertTo-ConfigChoice (Get-RequiredConfigValue $trigger "waveform") "trigger.waveform" @("constant", "pulse", "ramp", "heartbeat")
+  $strengthA = @(Get-RequiredConfigValue $trigger "strengthA")
+  $strengthB = @(Get-RequiredConfigValue $trigger "strengthB")
+  if ($strengthA.Count -ne 2 -or $strengthB.Count -ne 2) { throw "强度范围必须包含最小值和最大值。" }
+  $strengthAMin = ConvertTo-ConfigInt $strengthA[0] "trigger.strengthA[0]" 0 200
+  $strengthAMax = ConvertTo-ConfigInt $strengthA[1] "trigger.strengthA[1]" $strengthAMin 200
+  $strengthBMin = ConvertTo-ConfigInt $strengthB[0] "trigger.strengthB[0]" 0 200
+  $strengthBMax = ConvertTo-ConfigInt $strengthB[1] "trigger.strengthB[1]" $strengthBMin 200
+  $wavePeriod = ConvertTo-ConfigInt (Get-RequiredConfigValue $trigger "wavePeriodMs") "trigger.wavePeriodMs" 10 1000
+  $waveIntensity = ConvertTo-ConfigInt (Get-RequiredConfigValue $trigger "waveIntensity") "trigger.waveIntensity" 0 100
+  if ($version -eq 1 -and $trigger.PSObject.Properties.Name -notcontains "durationSeconds") {
+    $legacyDurationMs = ConvertTo-ConfigInt (Get-RequiredConfigValue $trigger "durationMs") "trigger.durationMs" 100 30000
+    $durationSeconds = [Math]::Max(1, [Math]::Min(30, [int][Math]::Ceiling($legacyDurationMs / 1000.0)))
+  } else {
+    $durationSeconds = ConvertTo-ConfigInt (Get-RequiredConfigValue $trigger "durationSeconds") "trigger.durationSeconds" 1 30
+  }
+  $maxContinuousSeconds = if ($trigger.PSObject.Properties.Name -contains "maxContinuousSeconds") {
+    ConvertTo-ConfigInt $trigger.maxContinuousSeconds "trigger.maxContinuousSeconds" 1 30
+  } else { 10 }
+  $cooldownSeconds = if ($trigger.PSObject.Properties.Name -contains "cooldownSeconds") {
+    ConvertTo-ConfigInt $trigger.cooldownSeconds "trigger.cooldownSeconds" 5 3600
+  } else { 60 }
+  $deviceMode = ConvertTo-ConfigChoice (Get-RequiredConfigValue $device "mode") "device.mode" @("http", "ble", "socket")
+  $httpEndpoint = ConvertTo-ConfigText (Get-RequiredConfigValue $device "httpEndpoint") "device.httpEndpoint" 2048
+  $bleAddress = ConvertTo-ConfigText (Get-RequiredConfigValue $device "bleAddress") "device.bleAddress" 64 -AllowEmpty
+  $socketMode = ConvertTo-ConfigChoice (Get-RequiredConfigValue $socket "mode") "device.socket.mode" @("local", "remote")
+  $localHost = ConvertTo-ConfigText (Get-RequiredConfigValue $socket "localHost") "device.socket.localHost" 255
+  $localPort = ConvertTo-ConfigInt (Get-RequiredConfigValue $socket "localPort") "device.socket.localPort" 1 65535
+  $remoteServer = ConvertTo-ConfigText (Get-RequiredConfigValue $socket "remoteServer") "device.socket.remoteServer" 2048
+  $softLimitA = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "softLimitA") "safety.softLimitA" 0 200
+  $softLimitB = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "softLimitB") "safety.softLimitB" 0 200
+  $httpLimitA = if ($safety.PSObject.Properties.Name -contains "httpLimitA") { ConvertTo-ConfigInt $safety.httpLimitA "safety.httpLimitA" 0 200 } else { $softLimitA }
+  $httpLimitB = if ($safety.PSObject.Properties.Name -contains "httpLimitB") { ConvertTo-ConfigInt $safety.httpLimitB "safety.httpLimitB" 0 200 } else { $softLimitB }
+  $frequencyBalanceA = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "frequencyBalanceA") "safety.frequencyBalanceA" 0 255
+  $frequencyBalanceB = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "frequencyBalanceB") "safety.frequencyBalanceB" 0 255
+  $strengthBalanceA = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "strengthBalanceA") "safety.strengthBalanceA" 0 255
+  $strengthBalanceB = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "strengthBalanceB") "safety.strengthBalanceB" 0 255
+  $whitelist = @(Get-RequiredConfigValue $scope "whitelist")
+  $blacklist = @(Get-RequiredConfigValue $scope "blacklist")
+  if ($whitelist.Count -gt 500 -or $blacklist.Count -gt 500) { throw "黑白名单分别最多允许 500 项。" }
+  $validatedWhitelist = @($whitelist | ForEach-Object { ConvertTo-ConfigText $_ "scope.whitelist" 512 })
+  $validatedBlacklist = @($blacklist | ForEach-Object { ConvertTo-ConfigText $_ "scope.blacklist" 512 })
+
+  Stop-ForConfigurationChange
+  $FocusMinutesInput.Text = [string]$sessionMinutes
+  $LeaveInput.Text = [string]$leaveSeconds
+  $IdleInput.Text = [string]$idleSeconds
+  $OutputModeCombo.SelectedIndex = @("untilWhitelist", "fixedDuration").IndexOf($outputMode)
+  $OverlapModeCombo.SelectedIndex = @("restart", "extend").IndexOf($overlapMode)
+  $ChannelModeCombo.SelectedIndex = @("both", "A", "B").IndexOf($channel)
+  $StrengthARangeInput.Text = "$strengthAMin-$strengthAMax"
+  $StrengthBRangeInput.Text = "$strengthBMin-$strengthBMax"
+  $WaveformCombo.SelectedIndex = @("constant", "pulse", "ramp", "heartbeat").IndexOf($waveform)
+  $WavePeriodInput.Text = [string]$wavePeriod
+  $WaveIntensityInput.Text = [string]$waveIntensity
+  $DurationInput.Text = [string]$durationSeconds
+  $MaxContinuousInput.Text = [string]$maxContinuousSeconds
+  $HoldCooldownInput.Text = [string]$cooldownSeconds
+  $HttpEndpointInput.Text = $httpEndpoint
+  $BleAddressInput.Text = $bleAddress
+  $LocalSocketHostInput.Text = $localHost
+  $LocalSocketPortInput.Text = [string]$localPort
+  $SocketServerInput.Text = $remoteServer
+  $HttpLimitAInput.Text = [string]$httpLimitA
+  $HttpLimitBInput.Text = [string]$httpLimitB
+  $SoftLimitAInput.Text = [string]$softLimitA
+  $SoftLimitBInput.Text = [string]$softLimitB
+  $FrequencyBalanceAInput.Text = [string]$frequencyBalanceA
+  $FrequencyBalanceBInput.Text = [string]$frequencyBalanceB
+  $StrengthBalanceAInput.Text = [string]$strengthBalanceA
+  $StrengthBalanceBInput.Text = [string]$strengthBalanceB
+  $WhitelistList.Items.Clear()
+  foreach ($item in $validatedWhitelist) { [void]$WhitelistList.Items.Add($item) }
+  $BlacklistList.Items.Clear()
+  foreach ($item in $validatedBlacklist) { [void]$BlacklistList.Items.Add($item) }
+  $SocketServerModeCombo.SelectedIndex = @("local", "remote").IndexOf($socketMode)
+  $DeviceModeCombo.SelectedIndex = @("http", "ble", "socket").IndexOf($deviceMode)
+  Refresh-CurrentWindow | Out-Null
+  Add-Log "已应用配置：$SourceName（格式版本 $version）"
+  Update-View
+}
+
+function Export-DesktopConfiguration {
+  $dialog = New-Object Microsoft.Win32.SaveFileDialog
+  $dialog.Title = "导出写作督促配置"
+  $dialog.Filter = "JSON 配置文件 (*.json)|*.json"
+  $dialog.FileName = "OCWritingFocus.config.json"
+  $dialog.AddExtension = $true
+  if ($dialog.ShowDialog() -ne $true) { return }
+  $json = (Get-DesktopConfiguration) | ConvertTo-Json -Depth 8
+  [IO.File]::WriteAllText($dialog.FileName, $json + [Environment]::NewLine, (New-Object Text.UTF8Encoding($true)))
+  Add-Log "配置已导出：$($dialog.FileName)"
+}
+
+function Import-DesktopConfiguration {
+  $dialog = New-Object Microsoft.Win32.OpenFileDialog
+  $dialog.Title = "导入写作督促配置"
+  $dialog.Filter = "JSON 配置文件 (*.json)|*.json"
+  $dialog.CheckFileExists = $true
+  if ($dialog.ShowDialog() -ne $true) { return }
+  try {
+    $file = Get-Item -LiteralPath $dialog.FileName
+    if ($file.Length -gt 1048576) { throw "配置文件不能超过 1 MB。" }
+    $config = [IO.File]::ReadAllText($file.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop
+    Set-DesktopConfiguration $config $file.Name
+  } catch {
+    Add-Log "配置导入失败：$($_.Exception.Message)"
+    [Windows.MessageBox]::Show("配置导入失败：`r`n`r`n$($_.Exception.Message)", "导入配置", "OK", "Error") | Out-Null
+  }
+}
+
+function Reset-SafeDesktopConfiguration {
+  $answer = [Windows.MessageBox]::Show(
+    "这会停止当前输出、断开设备、清空黑白名单，并恢复低强度固定时长配置。是否继续？",
+    "恢复安全默认值",
+    "YesNo",
+    "Warning")
+  if ($answer -ne [Windows.MessageBoxResult]::Yes) { return }
+  Set-DesktopConfiguration (Get-SafeDesktopConfiguration) "安全默认值"
+  $script:State.Locked = $true
+  Add-Log "安全默认值已恢复；为防止误触发，当前保持急停锁定"
+  Update-View
 }
 
 function Show-AppPage([string]$PageName) {
@@ -1351,6 +1869,8 @@ function Apply-CurrentWindowRule($CurrentWindowInfo = $null) {
       Invoke-DeviceStop
     }
     $script:State.WindowState = "writing"
+    $script:State.HoldRetriggerPending = $false
+    $script:State.HoldCooldownEnd = [DateTime]::MinValue
     $script:State.LeftSeconds = 0
     $script:State.DistractionSeconds = 0
     $script:State.AwayEpisodeActive = $false
@@ -1386,6 +1906,12 @@ function Update-View {
   $LeftValue.Text = Format-Seconds $script:State.LeftSeconds
   $DistractionValue.Text = Format-Seconds $script:State.DistractionSeconds
   $IdleValue.Text = Format-Seconds $script:State.IdleSeconds
+  if ($script:State.ActualStrengthKnown) {
+    $ActualStrengthValue.Text = "A $($script:State.ActualStrengthA)  |  B $($script:State.ActualStrengthB)"
+  } else {
+    $ActualStrengthValue.Text = "A --  |  B --"
+  }
+  $ActualStrengthSource.Text = $script:State.ActualStrengthSource
   if ($script:State.DeviceMode -eq "http") {
     $DeviceValue.Text = if ($script:State.Connected) { "真实桥接已连接" } else { "真实桥接未连接" }
     $DeviceBadge.Text = if ($script:State.Connected) { "真实设备桥接" } else { "真实桥接未连接" }
@@ -1469,7 +1995,9 @@ function Get-TriggerProfile {
     AStrength = $aStrength
     BStrength = $bStrength
     Channel = $channelName
-    DurationMs = Get-ClampedInt $DurationInput 5000 100 30000
+    DurationMs = (Get-ClampedInt $DurationInput 5 1 30) * 1000
+    MaxContinuousMs = (Get-ClampedInt $MaxContinuousInput 10 1 30) * 1000
+    CooldownMs = (Get-ClampedInt $HoldCooldownInput 60 5 3600) * 1000
     HoldUntilWhitelist = $OutputModeCombo.SelectedIndex -eq 0
     RestartOnRepeat = $OverlapModeCombo.SelectedIndex -eq 0
     WaveformName = @("constant", "pulse", "ramp", "heartbeat")[[Math]::Max(0, [Math]::Min(3, $WaveformCombo.SelectedIndex))]
@@ -1488,6 +2016,37 @@ function Get-BleSafetyConfig {
     StrengthBalanceA = Get-ClampedInt $StrengthBalanceAInput 0 0 255
     StrengthBalanceB = Get-ClampedInt $StrengthBalanceBInput 0 0 255
   }
+}
+
+function Get-EffectiveStrengthLimits {
+  switch ($script:State.DeviceMode) {
+    "socket" {
+      if (-not $script:State.SocketHasAppLimits) { throw "Socket 尚未收到 App 上报的 A/B 强度上限，已禁止输出。" }
+      return @{ A = [int]$script:State.SocketAppLimitA; B = [int]$script:State.SocketAppLimitB; Source = "DG-Lab App" }
+    }
+    "ble" {
+      $safety = Get-BleSafetyConfig
+      return @{ A = [int]$safety.SoftLimitA; B = [int]$safety.SoftLimitB; Source = "蓝牙手动" }
+    }
+    default {
+      return @{ A = Get-ClampedInt $HttpLimitAInput 80 0 200; B = Get-ClampedInt $HttpLimitBInput 80 0 200; Source = "HTTP 手动" }
+    }
+  }
+}
+
+function Limit-TriggerProfile($Profile) {
+  $limits = Get-EffectiveStrengthLimits
+  $requestedA = [int]$Profile.AStrength
+  $requestedB = [int]$Profile.BStrength
+  $Profile.AStrength = [Math]::Min($requestedA, [int]$limits.A)
+  $Profile.BStrength = [Math]::Min($requestedB, [int]$limits.B)
+  $Profile.StrengthLimitA = [int]$limits.A
+  $Profile.StrengthLimitB = [int]$limits.B
+  $Profile.StrengthLimitSource = [string]$limits.Source
+  if ($requestedA -ne $Profile.AStrength -or $requestedB -ne $Profile.BStrength) {
+    Add-Log "强度已按 $($limits.Source) 上限截断：A $requestedA→$($Profile.AStrength)，B $requestedB→$($Profile.BStrength)"
+  }
+  return $Profile
 }
 
 $script:Ble = @{
@@ -1659,6 +2218,7 @@ function Invoke-BleStop {
   $script:Ble.OutputProfile = $null
   try {
     Invoke-BleWrite (New-DglabB0Packet $null -Stop)
+    Set-ActualStrengthState 0 0 "蓝牙已确认下发"
     Add-Log "已将蓝牙 A/B 通道强度归零"
     return $true
   } catch {
@@ -1671,13 +2231,14 @@ function Invoke-BleActivate($Profile) {
   try {
     $now = Get-Date
     if ($Profile.HoldUntilWhitelist) {
-      $endAt = [DateTime]::MaxValue
+      $endAt = $now.AddMilliseconds($Profile.MaxContinuousMs)
     } elseif ($script:Ble.OutputActive -and -not $Profile.RestartOnRepeat -and $script:Ble.OutputEnd -gt $now) {
       $endAt = $script:Ble.OutputEnd.AddMilliseconds($Profile.DurationMs)
     } else {
       $endAt = $now.AddMilliseconds($Profile.DurationMs)
     }
     Invoke-BleWrite (New-DglabB0Packet $Profile)
+    Set-ActualStrengthState ([int]$Profile.AStrength) ([int]$Profile.BStrength) "蓝牙已确认下发"
     $script:Ble.OutputProfile = $Profile
     $script:Ble.OutputEnd = $endAt
     $script:Ble.OutputActive = $true
@@ -1733,6 +2294,9 @@ function Set-SocketBindingInfo([string]$ServerUri, [string]$ClientId) {
 }
 
 function Reset-SocketConnection {
+  if ($null -ne $script:State.SocketTransport) {
+    try { $script:State.SocketTransport.Dispose() } catch {}
+  }
   if ($null -ne $script:State.SocketClient) {
     try { $script:State.SocketClient.Abort() } catch {}
     try { $script:State.SocketClient.Dispose() } catch {}
@@ -1742,6 +2306,7 @@ function Reset-SocketConnection {
     try { $script:State.LocalSocketServer.Dispose() } catch {}
   }
   $script:State.SocketClient = $null
+  $script:State.SocketTransport = $null
   $script:State.LocalSocketServer = $null
   $script:State.LocalSocketLastError = ""
   $script:State.SocketClientId = ""
@@ -1749,12 +2314,62 @@ function Reset-SocketConnection {
   $script:State.SocketServerUri = ""
   $script:State.SocketReceiveTask = $null
   $script:State.SocketReceiveBuffer = $null
+  $script:State.SocketWatchdogStopCount = 0
+  $script:State.SocketAppStrengthA = 0
+  $script:State.SocketAppStrengthB = 0
+  $script:State.SocketAppLimitA = 0
+  $script:State.SocketAppLimitB = 0
+  $script:State.SocketHasAppLimits = $false
+  $script:State.SocketStrengthUpdateCount = 0
   $script:State.Connected = $false
+  Set-ActualStrengthState 0 0 "Socket 未连接" $false
   $SocketQrContentText.Text = ""
   $SocketManualAddressText.Text = ""
   $SocketQrImage.Source = $null
   $SocketQrPlaceholder.Visibility = [Windows.Visibility]::Visible
   $SocketBindStatusText.Text = "未连接服务器"
+  $SocketAppLimitsText.Text = "等待 App 上报 A/B 强度上限；未上报前禁止输出"
+}
+
+function Set-SocketAppStrengthState([int]$StrengthA, [int]$StrengthB, [int]$LimitA, [int]$LimitB) {
+  $a = [Math]::Max(0, [Math]::Min(200, $StrengthA))
+  $b = [Math]::Max(0, [Math]::Min(200, $StrengthB))
+  $limitAValue = [Math]::Max(0, [Math]::Min(200, $LimitA))
+  $limitBValue = [Math]::Max(0, [Math]::Min(200, $LimitB))
+  $limitsChanged = -not $script:State.SocketHasAppLimits -or $limitAValue -ne $script:State.SocketAppLimitA -or $limitBValue -ne $script:State.SocketAppLimitB
+  $script:State.SocketAppStrengthA = $a
+  $script:State.SocketAppStrengthB = $b
+  $script:State.SocketAppLimitA = $limitAValue
+  $script:State.SocketAppLimitB = $limitBValue
+  $script:State.SocketHasAppLimits = $true
+  $SocketAppLimitsText.Text = "当前 A=$a / 上限 $limitAValue；B=$b / 上限 $limitBValue（来自 App）"
+  Set-ActualStrengthState $a $b "Socket App 实时回报"
+  if ($limitsChanged) { Add-Log "已读取 DG-Lab App 强度上限：A=$limitAValue，B=$limitBValue" }
+
+  if ($script:State.OutputActive -and $null -ne $script:State.OutputProfile) {
+    $newA = [Math]::Min([int]$script:State.OutputProfile.AStrength, $limitAValue)
+    $newB = [Math]::Min([int]$script:State.OutputProfile.BStrength, $limitBValue)
+    if ($newA -ne $script:State.OutputProfile.AStrength -or $newB -ne $script:State.OutputProfile.BStrength) {
+      $script:State.OutputProfile.AStrength = $newA
+      $script:State.OutputProfile.BStrength = $newB
+      try {
+        Invoke-SocketSend "strength-1+2+$newA"
+        Invoke-SocketSend "strength-2+2+$newB"
+        Add-Log "App 上限降低，活动输出已立即降至 A=$newA，B=$newB"
+      } catch {
+        Add-Log "App 上限降低但强度下调发送失败，正在立即停止：$($_.Exception.Message)"
+        Invoke-SocketStop | Out-Null
+      }
+    }
+  }
+}
+
+function Try-ApplySocketStrengthMessage([string]$Body) {
+  if ($Body -match '^strength-(\d{1,3})\+(\d{1,3})\+(\d{1,3})\+(\d{1,3})$') {
+    Set-SocketAppStrengthState ([int]$Matches[1]) ([int]$Matches[2]) ([int]$Matches[3]) ([int]$Matches[4])
+    return $true
+  }
+  return $false
 }
 
 function Start-SocketReceive {
@@ -1777,17 +2392,27 @@ function Update-SocketReceive {
     $message = $json | ConvertFrom-Json
     if ($message.type -eq "bind" -and $message.message -eq "targetId") {
       $script:State.SocketClientId = [string]$message.clientId
+      if ($null -ne $script:State.SocketTransport) { $script:State.SocketTransport.UpdateBinding($script:State.SocketClientId, "") }
       Set-SocketBindingInfo $script:State.SocketServerUri $script:State.SocketClientId
       $SocketBindStatusText.Text = "服务器已注册，等待 App 扫码或手动连接"
       Add-Log "Socket 终端已注册，等待 App 绑定：$($script:State.SocketClientId)"
     } elseif ($message.type -eq "bind" -and [string]$message.message -eq "200" -and [string]$message.clientId -eq $script:State.SocketClientId) {
       $script:State.SocketTargetId = [string]$message.targetId
+      $script:State.SocketHasAppLimits = $false
+      $SocketAppLimitsText.Text = "App 已绑定，等待上报 A/B 强度上限；当前禁止输出"
+      if ($null -ne $script:State.SocketTransport) { $script:State.SocketTransport.UpdateBinding($script:State.SocketClientId, $script:State.SocketTargetId) }
       $script:State.Connected = $true
       $SocketBindStatusText.Text = "App 已绑定，可以发送控制指令"
       Add-Log "Socket App 已绑定：$($script:State.SocketTargetId)"
+    } elseif ($message.type -eq "msg" -and $script:State.Connected -and
+      [string]$message.clientId -eq $script:State.SocketTargetId -and
+      [string]$message.targetId -eq $script:State.SocketClientId) {
+      [void](Try-ApplySocketStrengthMessage ([string]$message.message))
     } elseif ($message.type -eq "break") {
       $script:State.Connected = $false
       $script:State.SocketTargetId = ""
+      $script:State.SocketHasAppLimits = $false
+      $SocketAppLimitsText.Text = "等待 App 上报 A/B 强度上限；未上报前禁止输出"
       $SocketBindStatusText.Text = "App 已断开，请重新扫码绑定"
       Add-Log "Socket App 已断开"
     }
@@ -1838,13 +2463,21 @@ function Update-LocalSocketServer {
   if ($server.IsBound -and -not $script:State.Connected) {
     $script:State.SocketTargetId = $server.TargetId
     $script:State.Connected = $true
-    $SocketBindStatusText.Text = "App 已绑定本地服务器，可以发送控制指令"
+    $script:State.SocketHasAppLimits = $false
+    $SocketAppLimitsText.Text = "App 已绑定，等待上报 A/B 强度上限；当前禁止输出"
+    $SocketBindStatusText.Text = "App 已绑定本地服务器，等待强度上限"
     Add-Log "Socket App 已绑定本地服务器：$($script:State.SocketTargetId)"
   } elseif (-not $server.IsBound -and $script:State.Connected) {
     $script:State.Connected = $false
     $script:State.SocketTargetId = ""
+    $script:State.SocketHasAppLimits = $false
+    $SocketAppLimitsText.Text = "等待 App 上报 A/B 强度上限；未上报前禁止输出"
     $SocketBindStatusText.Text = "App 已断开，请重新扫码绑定"
     Add-Log "Socket App 已从本地服务器断开"
+  }
+  if ($server.HasAppLimits -and $server.StrengthUpdateCount -ne $script:State.SocketStrengthUpdateCount) {
+    $script:State.SocketStrengthUpdateCount = $server.StrengthUpdateCount
+    Set-SocketAppStrengthState $server.AppStrengthA $server.AppStrengthB $server.AppLimitA $server.AppLimitB
   }
 }
 
@@ -1857,11 +2490,17 @@ function Invoke-RemoteSocketConnect {
       throw "Socket 模式需要 ws:// 或 wss:// 服务器地址，例如 ws://192.168.1.10:5678。"
     }
     $client = New-Object System.Net.WebSockets.ClientWebSocket
-    $client.ConnectAsync($uri, [Threading.CancellationToken]::None).Wait()
+    $connectTimeout = New-Object Threading.CancellationTokenSource 5000
+    try {
+      $client.ConnectAsync($uri, $connectTimeout.Token).Wait()
+    } finally {
+      $connectTimeout.Dispose()
+    }
     if ($client.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
       throw "Socket 连接未进入 Open 状态。"
     }
     $script:State.SocketClient = $client
+    $script:State.SocketTransport = New-Object DglabRemoteSocketTransport $client
     $script:State.SocketServerUri = $text
     $SocketBindStatusText.Text = "服务器已连接，正在注册终端…"
     Start-SocketReceive
@@ -1888,39 +2527,63 @@ function Invoke-SocketSend([string]$Command) {
     $script:State.LocalSocketServer.SendCommand($Command)
     return
   }
-  $payload = @{
-    type = "msg"
-    clientId = $script:State.SocketClientId
-    targetId = $script:State.SocketTargetId
-    message = $Command
-  } | ConvertTo-Json -Compress
-  $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
-  $segment = New-Object 'System.ArraySegment[byte]' (,$bytes)
-  $script:State.SocketClient.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait()
+  if ($null -eq $script:State.SocketTransport) { throw "Socket 安全传输器未初始化" }
+  $script:State.SocketTransport.SendCommand($Command)
 }
 
 function Invoke-SocketStop {
-  try {
-    Invoke-SocketSend "clear-1"
-    Invoke-SocketSend "clear-2"
-    Invoke-SocketSend "strength-1+2+0"
-    Invoke-SocketSend "strength-2+2+0"
-    Add-Log "已发送 Socket 停止指令"
-    return $true
-  } catch {
-    Add-Log "Socket 停止失败：$($_.Exception.Message)"
+  $transport = if ($null -ne $script:State.LocalSocketServer) { $script:State.LocalSocketServer } else { $script:State.SocketTransport }
+  if ($null -eq $transport) {
+    Add-Log "Socket 停止失败：安全传输器不可用"
     return $false
+  }
+  try {
+    $stopped = $transport.StopOutputReliable(3)
+    if ($stopped) {
+      $transport.CancelSafetyTimeout()
+      Set-ActualStrengthState 0 0 "Socket 停止命令已下发"
+      Add-Log "Socket A/B 已归零并清除波形（独立命令、最多重试 3 次）"
+      return $true
+    }
+    Add-Log "Socket 停止未全部成功：$($transport.LastError)；后台看门狗仍保持待命"
+    return $false
+  } catch {
+    Add-Log "Socket 停止异常：$($_.Exception.Message)；后台看门狗仍保持待命"
+    return $false
+  }
+}
+
+function Arm-SocketSafetyWatchdog([int]$TimeoutMs) {
+  $transport = if ($null -ne $script:State.LocalSocketServer) { $script:State.LocalSocketServer } else { $script:State.SocketTransport }
+  if ($null -eq $transport) { throw "Socket 安全看门狗不可用" }
+  $transport.ArmSafetyTimeout($TimeoutMs)
+  $script:State.SocketWatchdogStopCount = $transport.WatchdogStopCount
+}
+
+function Update-SocketSafetyWatchdogStatus {
+  $transport = if ($null -ne $script:State.LocalSocketServer) { $script:State.LocalSocketServer } else { $script:State.SocketTransport }
+  if ($null -eq $transport) { return }
+  if ($transport.WatchdogStopCount -gt $script:State.SocketWatchdogStopCount) {
+    $script:State.SocketWatchdogStopCount = $transport.WatchdogStopCount
+    if ($transport.LastWatchdogStopSucceeded) {
+      Set-ActualStrengthState 0 0 "Socket 看门狗已下发"
+      Add-Log "Socket 后台安全看门狗已独立执行 A/B 归零"
+    } else {
+      Add-Log "警告：Socket 后台安全看门狗未能完成全部停止命令：$($transport.LastError)"
+    }
   }
 }
 
 function Invoke-SocketActivate($Profile) {
   try {
+    $Profile = Limit-TriggerProfile $Profile
     $a = if ($Profile.Channel -in @("A", "both")) { $Profile.AStrength } else { 0 }
     $b = if ($Profile.Channel -in @("B", "both")) { $Profile.BStrength } else { 0 }
     Invoke-SocketSend "clear-1"
     Invoke-SocketSend "clear-2"
     Invoke-SocketSend "strength-1+2+$a"
     Invoke-SocketSend "strength-2+2+$b"
+    Set-ActualStrengthState $a $b "Socket 已下发，等待 App 回报"
     return $true
   } catch {
     Add-Log "Socket 触发失败：$($_.Exception.Message)"
@@ -1965,6 +2628,8 @@ function Invoke-DeviceStop {
   $script:State.OutputHoldUntilWhitelist = $false
   $script:State.OutputProfile = $null
   $script:State.OutputEnd = [DateTime]::MinValue
+  $script:State.HoldRetriggerPending = $false
+  $script:State.HoldCooldownEnd = [DateTime]::MinValue
   $script:State.HttpRenewAt = [DateTime]::MinValue
   if ($script:State.DeviceMode -eq "ble") {
     return Invoke-BleStop
@@ -1977,6 +2642,7 @@ function Invoke-DeviceStop {
     $url = Get-EndpointUrl "stop"
     $body = @{ action = "stop" } | ConvertTo-Json -Depth 4
     Invoke-RestMethod -Method Post -Uri $url -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
+    Set-ActualStrengthState 0 0 "HTTP 桥接已确认接收"
     Add-Log "已发送真实设备停止指令"
     return $true
   } catch {
@@ -1989,8 +2655,8 @@ function Invoke-HttpActivate($Profile) {
   try {
     $url = Get-EndpointUrl "activate"
     $legacyIntensity = [Math]::Max($Profile.AStrength, $Profile.BStrength)
-    $duration = if ($Profile.HoldUntilWhitelist) { 30000 } else { $Profile.DurationMs }
-    $safety = Get-BleSafetyConfig
+    $duration = if ($Profile.HoldUntilWhitelist) { $Profile.MaxContinuousMs } else { $Profile.DurationMs }
+    $limits = Get-EffectiveStrengthLimits
     $body = @{
       action = "activate"
       intensity = $legacyIntensity
@@ -2003,10 +2669,11 @@ function Invoke-HttpActivate($Profile) {
       overrides = $Profile.RestartOnRepeat
       wavePeriodMs = $Profile.WavePeriodMs
       waveIntensity = $Profile.WaveIntensity
-      softLimitA = $safety.SoftLimitA
-      softLimitB = $safety.SoftLimitB
+      softLimitA = $limits.A
+      softLimitB = $limits.B
     } | ConvertTo-Json -Depth 4
     Invoke-RestMethod -Method Post -Uri $url -ContentType "application/json" -Body $body -TimeoutSec 5 | Out-Null
+    Set-ActualStrengthState ([int]$Profile.AStrength) ([int]$Profile.BStrength) "HTTP 桥接已确认接收"
     return $true
   } catch {
     Add-Log "真实设备触发失败：$($_.Exception.Message)"
@@ -2034,7 +2701,12 @@ function Invoke-Trigger($Reason) {
     return $false
   }
   $profile = Get-TriggerProfile
-  if ($Reason -notin @("黑名单直接触发", "离开写作范围")) {
+  try { $profile = Limit-TriggerProfile $profile }
+  catch {
+    Add-Log "触发被拦截：$($_.Exception.Message)"
+    return $false
+  }
+  if ($Reason -notin @("黑名单直接触发", "离开写作范围", "冷却结束仍未返回白名单")) {
     $profile.HoldUntilWhitelist = $false
   }
   $sent = Invoke-DeviceActivate $profile
@@ -2042,16 +2714,26 @@ function Invoke-Trigger($Reason) {
     return $false
   }
 
+  $activeDurationMs = if ($profile.HoldUntilWhitelist) { $profile.MaxContinuousMs } else { $profile.DurationMs }
+  if ($script:State.DeviceMode -eq "socket") {
+    try { Arm-SocketSafetyWatchdog $activeDurationMs }
+    catch {
+      Add-Log "Socket 安全看门狗启动失败，已立即停止输出：$($_.Exception.Message)"
+      Invoke-SocketStop | Out-Null
+      return $false
+    }
+  }
+
   $script:State.OutputActive = $true
   $script:State.OutputHoldUntilWhitelist = $profile.HoldUntilWhitelist
   $script:State.OutputProfile = $profile
-  $script:State.OutputEnd = if ($profile.HoldUntilWhitelist) { [DateTime]::MaxValue } else { (Get-Date).AddMilliseconds($profile.DurationMs) }
-  if ($script:State.DeviceMode -eq "http" -and $profile.HoldUntilWhitelist) {
-    $script:State.HttpRenewAt = (Get-Date).AddSeconds(25)
-  }
+  $script:State.OutputEnd = (Get-Date).AddMilliseconds($activeDurationMs)
+  $script:State.HoldRetriggerPending = $false
+  $script:State.HoldCooldownEnd = [DateTime]::MinValue
+  $script:State.HttpRenewAt = [DateTime]::MinValue
 
   $prefix = if ($script:State.DeviceMode -eq "ble") { "蓝牙输出" } else { "HTTP 输出" }
-  $durationText = if ($profile.HoldUntilWhitelist) { "返回白名单时停止" } else { "$($profile.DurationMs)ms" }
+  $durationText = if ($profile.HoldUntilWhitelist) { "最长 $([int]($profile.MaxContinuousMs / 1000)) 秒，随后冷却 $([int]($profile.CooldownMs / 1000)) 秒" } else { "$([int]($profile.DurationMs / 1000)) 秒" }
   Add-Log "$Reason：$prefix 通道 $($profile.Channel)，A=$($profile.AStrength) B=$($profile.BStrength)，波形 $($profile.WaveformName)，$durationText"
   Update-View
   return $true
@@ -2150,6 +2832,7 @@ $SocketServerModeCombo.Add_SelectionChanged({
 $DeviceModeCombo.Add_SelectionChanged({
   if ($script:State.OutputActive -and $script:State.Connected) { Invoke-DeviceStop | Out-Null }
   if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
+  Set-ActualStrengthState 0 0 "设备模式已切换，等待连接" $false
   $HttpConnectionPage.Visibility = [Windows.Visibility]::Collapsed
   $BleConnectionPage.Visibility = [Windows.Visibility]::Collapsed
   $SocketConnectionPage.Visibility = [Windows.Visibility]::Collapsed
@@ -2186,11 +2869,21 @@ $DisconnectButton.Add_Click({
   $script:Ble.WriteCharacteristic = $null
   $script:Ble.Service = $null
   $script:Ble.Device = $null
+  Set-ActualStrengthState 0 0 "设备已断开" $false
   Add-Log "设备连接已断开"
   Update-View
 })
 $StopButton.Add_Click({ Invoke-DeviceStop; Update-View })
 $ClearLogsButton.Add_Click({ $LogList.Items.Clear() })
+$ImportConfigButton.Add_Click({ Import-DesktopConfiguration })
+$ExportConfigButton.Add_Click({
+  try { Export-DesktopConfiguration }
+  catch {
+    Add-Log "配置导出失败：$($_.Exception.Message)"
+    [Windows.MessageBox]::Show("配置导出失败：`r`n`r`n$($_.Exception.Message)", "导出配置", "OK", "Error") | Out-Null
+  }
+})
+$ResetSafeConfigButton.Add_Click({ Reset-SafeDesktopConfiguration })
 
 $RefreshWindowListButton.Add_Click({
   Refresh-WindowPicker
@@ -2238,11 +2931,46 @@ $RemoveBlacklistButton.Add_Click({
   Refresh-CurrentWindow | Out-Null
 })
 
+function Update-OutputExpiration {
+  if (-not $script:State.OutputActive -or (Get-Date) -lt $script:State.OutputEnd) {
+    return
+  }
+  $wasHoldMode = $script:State.OutputHoldUntilWhitelist
+  $expiredProfile = $script:State.OutputProfile
+  Invoke-DeviceStop | Out-Null
+  if ($wasHoldMode -and $null -ne $expiredProfile -and $script:State.WindowState -in @("left", "blacklist")) {
+    $script:State.HoldRetriggerPending = $true
+    $script:State.HoldCooldownEnd = (Get-Date).AddMilliseconds($expiredProfile.CooldownMs)
+    Add-Log "已达到最长连续输出时间并停止；进入 $([int]($expiredProfile.CooldownMs / 1000)) 秒冷却期"
+  }
+}
+
+function Update-HoldCooldown {
+  if (-not $script:State.HoldRetriggerPending) { return }
+  if ($script:State.WindowState -eq "writing" -or -not $script:State.Running -or $script:State.Paused -or $script:State.Locked) {
+    $script:State.HoldRetriggerPending = $false
+    $script:State.HoldCooldownEnd = [DateTime]::MinValue
+    return
+  }
+  if ((Get-Date) -lt $script:State.HoldCooldownEnd) { return }
+  if ($script:State.WindowState -notin @("left", "blacklist") -or -not $script:State.Connected) {
+    $script:State.HoldCooldownEnd = (Get-Date).AddSeconds(5)
+    return
+  }
+  $script:State.HoldRetriggerPending = $false
+  if (-not (Invoke-Trigger "冷却结束仍未返回白名单")) {
+    $script:State.HoldRetriggerPending = $true
+    $script:State.HoldCooldownEnd = (Get-Date).AddSeconds(5)
+  }
+}
+
 $bleOutputTimer = New-Object Windows.Threading.DispatcherTimer
 $bleOutputTimer.Interval = [TimeSpan]::FromMilliseconds(100)
 $bleOutputTimer.Add_Tick({
   if (-not $script:Ble.OutputActive) { return }
-  if (-not $script:State.Connected -or $script:State.Locked -or (Get-Date) -ge $script:Ble.OutputEnd) {
+  Update-OutputExpiration
+  if (-not $script:Ble.OutputActive) { return }
+  if (-not $script:State.Connected -or $script:State.Locked) {
     Invoke-DeviceStop | Out-Null
     return
   }
@@ -2262,6 +2990,7 @@ $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
   if ($script:State.DeviceMode -eq "socket") {
     if ($null -ne $script:State.LocalSocketServer) { Update-LocalSocketServer } else { Update-SocketReceive }
+    Update-SocketSafetyWatchdogStatus
   }
   # 当前前台窗口展示与专注会话解耦，任何状态下都保持实时更新。
   $currentWindowInfo = Refresh-CurrentWindow
@@ -2315,17 +3044,8 @@ $timer.Add_Tick({
     }
   }
 
-  if ($script:State.OutputActive -and $script:State.OutputHoldUntilWhitelist -and $script:State.DeviceMode -eq "http" -and $script:State.Connected -and (Get-Date) -ge $script:State.HttpRenewAt) {
-    if (Invoke-HttpActivate $script:State.OutputProfile) {
-      $script:State.HttpRenewAt = (Get-Date).AddSeconds(25)
-    } else {
-      $script:State.OutputActive = $false
-    }
-  }
-  if ($script:State.OutputActive -and -not $script:State.OutputHoldUntilWhitelist -and $script:State.DeviceMode -in @("http", "socket") -and (Get-Date) -ge $script:State.OutputEnd) {
-    $script:State.OutputActive = $false
-    $script:State.OutputProfile = $null
-  }
+  Update-OutputExpiration
+  Update-HoldCooldown
   Update-View
 })
 
@@ -2346,6 +3066,89 @@ Refresh-CurrentWindow | Out-Null
 Refresh-WindowPicker
 Add-Log "桌面应用已启动"
 Update-View
+if ($env:OC_WRITING_FOCUS_SELF_TEST -eq "1") {
+  $timer.Stop()
+  $bleOutputTimer.Stop()
+  Set-DesktopConfiguration (Get-SafeDesktopConfiguration) "自动测试安全默认值"
+  $roundTrip = ((Get-DesktopConfiguration) | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+  Set-DesktopConfiguration $roundTrip "自动测试往返配置"
+  if ($roundTrip.schemaVersion -ne 2 -or $roundTrip.trigger.outputMode -ne "fixedDuration" -or $roundTrip.trigger.durationSeconds -ne 1) {
+    throw "配置 JSON 往返测试失败"
+  }
+  if ($StrengthARangeInput.Text -ne "10-20" -or $SoftLimitAInput.Text -ne "30" -or $HttpLimitAInput.Text -ne "30" -or $DurationInput.Text -ne "1" -or $MaxContinuousInput.Text -ne "10" -or $HoldCooldownInput.Text -ne "60") {
+    throw "安全默认值应用测试失败"
+  }
+  $legacyConfig = ($roundTrip | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
+  $legacyConfig.schemaVersion = 1
+  $legacyConfig.trigger | Add-Member -NotePropertyName durationMs -NotePropertyValue 1500
+  $legacyConfig.trigger.PSObject.Properties.Remove("durationSeconds")
+  Set-DesktopConfiguration $legacyConfig "自动测试旧版配置"
+  if ($DurationInput.Text -ne "2" -or (Get-TriggerProfile).DurationMs -ne 2000) {
+    throw "旧版毫秒配置转换或秒到毫秒内部换算失败"
+  }
+  $invalidRejected = $false
+  try {
+    $roundTrip.trigger.durationSeconds = 999999
+    Set-DesktopConfiguration $roundTrip "无效配置"
+  } catch {
+    $invalidRejected = $true
+  }
+  if (-not $invalidRejected) { throw "无效配置未被拒绝" }
+  Set-ActualStrengthState 17 23 "自动测试"
+  if ($ActualStrengthValue.Text -ne "A 17  |  B 23" -or $ActualStrengthSource.Text -ne "自动测试") { throw "A/B 实际强度显示测试失败" }
+  $profileLimitTest = @{ AStrength = 90; BStrength = 70 }
+  $script:State.DeviceMode = "http"
+  $HttpLimitAInput.Text = "20"; $HttpLimitBInput.Text = "30"
+  $profileLimitTest = Limit-TriggerProfile $profileLimitTest
+  if ($profileLimitTest.AStrength -ne 20 -or $profileLimitTest.BStrength -ne 30) { throw "HTTP 手动上限截断失败" }
+  $script:State.DeviceMode = "socket"
+  $script:State.SocketHasAppLimits = $false
+  $socketUnknownBlocked = $false
+  try { Limit-TriggerProfile @{ AStrength = 10; BStrength = 10 } | Out-Null } catch { $socketUnknownBlocked = $true }
+  if (-not $socketUnknownBlocked) { throw "Socket 未获 App 上限时没有禁止输出" }
+  Set-SocketAppStrengthState 12 14 15 18
+  $profileLimitTest = Limit-TriggerProfile @{ AStrength = 50; BStrength = 60 }
+  if ($profileLimitTest.AStrength -ne 15 -or $profileLimitTest.BStrength -ne 18) { throw "Socket App 上限截断失败" }
+  $script:SocketStopCalledByTimer = $false
+  function Invoke-DeviceStop {
+    $script:SocketStopCalledByTimer = $true
+    $script:State.OutputActive = $false
+    $script:State.OutputHoldUntilWhitelist = $false
+    $script:State.OutputProfile = $null
+    $script:State.OutputEnd = [DateTime]::MinValue
+    $script:State.HoldRetriggerPending = $false
+    $script:State.HoldCooldownEnd = [DateTime]::MinValue
+    return $true
+  }
+  $script:State.DeviceMode = "socket"
+  $script:State.OutputActive = $true
+  $script:State.OutputHoldUntilWhitelist = $false
+  $script:State.OutputEnd = (Get-Date).AddSeconds(-1)
+  Update-OutputExpiration
+  if (-not $script:SocketStopCalledByTimer) { throw "Socket 到期未调用停止流程" }
+  $script:SocketStopCalledByTimer = $false
+  $script:State.WindowState = "left"
+  $script:State.OutputActive = $true
+  $script:State.OutputHoldUntilWhitelist = $true
+  $script:State.OutputProfile = @{ CooldownMs = 5000 }
+  $script:State.OutputEnd = (Get-Date).AddSeconds(-1)
+  Update-OutputExpiration
+  if (-not $script:SocketStopCalledByTimer -or -not $script:State.HoldRetriggerPending) { throw "持续模式到期未停止或未进入冷却" }
+  $script:HoldRetriggerTestCalled = $false
+  function Invoke-Trigger($Reason) {
+    if ($Reason -eq "冷却结束仍未返回白名单") { $script:HoldRetriggerTestCalled = $true; return $true }
+    return $false
+  }
+  $script:State.Running = $true
+  $script:State.Paused = $false
+  $script:State.Locked = $false
+  $script:State.Connected = $true
+  $script:State.HoldCooldownEnd = (Get-Date).AddSeconds(-1)
+  Update-HoldCooldown
+  if (-not $script:HoldRetriggerTestCalled -or $script:State.HoldRetriggerPending) { throw "冷却结束后未按条件重新触发" }
+  Write-Output "Desktop config, bounded hold/cooldown, and Socket expiration: OK"
+  return
+}
 [void]$window.ShowDialog()
 
 
