@@ -92,6 +92,9 @@ export class ConfigService {
     if (config.deviceMode === "real" && !config.coyote?.endpoint) {
       errors.push("real device mode requires coyote.endpoint");
     }
+    if (!['http', 'websocket', 'socket'].includes(config.coyote?.transport)) {
+      errors.push("coyote.transport must be http, websocket, or socket");
+    }
     return { valid: errors.length === 0, errors };
   }
 

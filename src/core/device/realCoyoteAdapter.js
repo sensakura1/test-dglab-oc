@@ -4,6 +4,8 @@ export class RealCoyoteAdapter {
     this.connected = false;
     this.lastError = undefined;
     this.ws = null;
+    this.clientId = config.clientId ?? "";
+    this.targetId = config.targetId ?? "";
   }
 
   async connect() {
@@ -36,6 +38,15 @@ export class RealCoyoteAdapter {
 
   async activate(options) {
     if (!this.connected) throw new Error("Coyote device is not connected");
+    if (this.config.transport === "socket") {
+      this.#assertSocketBinding();
+      const intensity = Number(options.intensity ?? 0);
+      const intensityA = Number(options.intensityA ?? intensity);
+      const intensityB = Number(options.intensityB ?? intensity);
+      await this.#sendSocketCommand(`strength-1+2+${Math.max(0, Math.min(200, Math.round(intensityA)))}`);
+      await this.#sendSocketCommand(`strength-2+2+${Math.max(0, Math.min(200, Math.round(intensityB)))}`);
+      return;
+    }
     const payload = {
       action: "activate",
       token: this.config.pairingToken,
@@ -46,6 +57,14 @@ export class RealCoyoteAdapter {
 
   async stop() {
     if (!this.connected) throw new Error("Coyote device is not connected");
+    if (this.config.transport === "socket") {
+      this.#assertSocketBinding();
+      await this.#sendSocketCommand("clear-1");
+      await this.#sendSocketCommand("clear-2");
+      await this.#sendSocketCommand("strength-1+2+0");
+      await this.#sendSocketCommand("strength-2+2+0");
+      return;
+    }
     const payload = {
       action: "stop",
       token: this.config.pairingToken
@@ -58,6 +77,21 @@ export class RealCoyoteAdapter {
       connected: this.connected,
       lastError: this.lastError
     };
+  }
+
+  #assertSocketBinding() {
+    if (!this.clientId || !this.targetId) {
+      throw new Error("DG-Lab Socket client is not bound");
+    }
+  }
+
+  async #sendSocketCommand(message) {
+    await this.#send({
+      type: "msg",
+      clientId: this.clientId,
+      targetId: this.targetId,
+      message
+    });
   }
 
   async #send(payload) {

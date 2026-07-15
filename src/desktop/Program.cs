@@ -11,7 +11,9 @@ namespace OCWritingFocus
 {
     internal static class Program
     {
-        private const string ScriptResourceName = "OCWritingFocusApp.Wpf.ps1";
+        private const string AppDirectoryName = "app";
+        private const string ScriptFileName = "OCWritingFocusApp.Wpf.ps1";
+        private const string QrCoderFileName = "QRCoder.dll";
 
         [STAThread]
         private static void Main()
@@ -19,10 +21,11 @@ namespace OCWritingFocus
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Environment.CurrentDirectory = AppDomain.CurrentDomain.BaseDirectory;
+            AppDomain.CurrentDomain.AssemblyResolve += ResolveExternalAssembly;
 
             try
             {
-                string script = ReadEmbeddedScript();
+                string script = ReadExternalScript();
                 using (Runspace runspace = RunspaceFactory.CreateRunspace())
                 {
                     runspace.ApartmentState = ApartmentState.STA;
@@ -68,27 +71,46 @@ namespace OCWritingFocus
                 MessageBox.Show(
                     "程序启动失败：\r\n\r\n" + exception.Message +
                     "\r\n\r\n错误日志：" + errorLogPath,
-                    "OC 设定写作督促工具",
+                    "OC 写作专注工具",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
             }
         }
 
-        private static string ReadEmbeddedScript()
+        private static string GetAppFilePath(string fileName)
         {
-            Assembly assembly = Assembly.GetExecutingAssembly();
-            using (Stream stream = assembly.GetManifestResourceStream(ScriptResourceName))
-            {
-                if (stream == null)
-                {
-                    throw new InvalidOperationException("未找到内嵌的桌面程序资源。");
-                }
+            return Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory,
+                AppDirectoryName,
+                fileName);
+        }
 
-                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8, true))
-                {
-                    return reader.ReadToEnd();
-                }
+        private static string ReadExternalScript()
+        {
+            string scriptPath = GetAppFilePath(ScriptFileName);
+            if (!File.Exists(scriptPath))
+            {
+                throw new FileNotFoundException(
+                    "未找到桌面程序脚本，请确保 app 文件夹与 EXE 一起分发。",
+                    scriptPath);
             }
+
+            using (StreamReader reader = new StreamReader(scriptPath, Encoding.UTF8, true))
+            {
+                return reader.ReadToEnd();
+            }
+        }
+
+        private static Assembly ResolveExternalAssembly(object sender, ResolveEventArgs args)
+        {
+            AssemblyName requested = new AssemblyName(args.Name);
+            if (!string.Equals(requested.Name, "QRCoder", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            string assemblyPath = GetAppFilePath(QrCoderFileName);
+            return File.Exists(assemblyPath) ? Assembly.LoadFrom(assemblyPath) : null;
         }
     }
 }

@@ -8,7 +8,7 @@
     "start": "npm run desktop",
     "build:desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
     "desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File src\\desktop\\OCWritingFocusApp.Wpf.ps1",
-    "test": "node --test tests/**/*.test.js"
+    "test": "node --test tests/**/*.test.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\\desktop\\localSocketServer.test.ps1"
   },
   "engines": {
     "node": ">=22"

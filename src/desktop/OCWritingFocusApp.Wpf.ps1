@@ -1,10 +1,18 @@
 ﻿Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
-Add-Type @"
+Add-Type -AssemblyName System.Web.Extensions
+Add-Type -ReferencedAssemblies @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") -TypeDefinition @"
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
 
 public static class NativeWindowApi
 {
@@ -45,6 +53,259 @@ public static class NativeWindowApi
         }
         return unchecked((uint)Environment.TickCount - inputInfo.dwTime);
     }
+}
+
+public sealed class LocalDglabSocketServer : IDisposable
+{
+    private readonly object sync = new object();
+    private readonly JavaScriptSerializer json = new JavaScriptSerializer();
+    private TcpListener listener;
+    private TcpClient appClient;
+    private NetworkStream appStream;
+    private Thread acceptThread;
+    private volatile bool stopping;
+
+    public string ClientId { get; private set; }
+    public string TargetId { get; private set; }
+    public string LastError { get; private set; }
+    public bool IsRunning { get; private set; }
+    public bool IsBound { get; private set; }
+    public int Port { get; private set; }
+
+    public LocalDglabSocketServer()
+    {
+        ClientId = Guid.NewGuid().ToString();
+        TargetId = "";
+        LastError = "";
+    }
+
+    public void Start(int port)
+    {
+        if (IsRunning) throw new InvalidOperationException("Server is already running.");
+        Port = port;
+        stopping = false;
+        listener = new TcpListener(IPAddress.Any, port);
+        listener.Start();
+        IsRunning = true;
+        acceptThread = new Thread(AcceptLoop);
+        acceptThread.IsBackground = true;
+        acceptThread.Name = "DG-Lab Local Socket Server";
+        acceptThread.Start();
+    }
+
+    private void AcceptLoop()
+    {
+        while (!stopping)
+        {
+            try
+            {
+                TcpClient client = listener.AcceptTcpClient();
+                Thread worker = new Thread(() => HandleClient(client));
+                worker.IsBackground = true;
+                worker.Start();
+            }
+            catch (SocketException ex)
+            {
+                if (!stopping) LastError = ex.Message;
+            }
+            catch (ObjectDisposedException) { break; }
+        }
+    }
+
+    private void HandleClient(TcpClient client)
+    {
+        try
+        {
+            NetworkStream stream = client.GetStream();
+            string request = ReadHttpRequest(stream);
+            string key = GetHeader(request, "Sec-WebSocket-Key");
+            if (string.IsNullOrWhiteSpace(key)) throw new InvalidDataException("Missing Sec-WebSocket-Key.");
+            string accept;
+            using (SHA1 sha1 = SHA1.Create())
+            {
+                byte[] hash = sha1.ComputeHash(Encoding.ASCII.GetBytes(key.Trim() + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+                accept = Convert.ToBase64String(hash);
+            }
+            string response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
+            byte[] responseBytes = Encoding.ASCII.GetBytes(response);
+            stream.Write(responseBytes, 0, responseBytes.Length);
+
+            lock (sync)
+            {
+                if (appClient != null) { try { appClient.Close(); } catch { } }
+                appClient = client;
+                appStream = stream;
+                TargetId = Guid.NewGuid().ToString();
+                IsBound = false;
+            }
+
+            SendEnvelope("bind", TargetId, "", "targetId");
+            while (!stopping && client.Connected)
+            {
+                string text = ReadTextFrame(stream);
+                if (text == null) break;
+                if (text.Length > 0) HandleMessage(text);
+            }
+        }
+        catch (Exception ex)
+        {
+            if (!stopping) LastError = ex.Message;
+        }
+        finally
+        {
+            lock (sync)
+            {
+                if (ReferenceEquals(appClient, client))
+                {
+                    appClient = null;
+                    appStream = null;
+                    TargetId = "";
+                    IsBound = false;
+                }
+            }
+            try { client.Close(); } catch { }
+        }
+    }
+
+    private void HandleMessage(string text)
+    {
+        Dictionary<string, object> message = json.Deserialize<Dictionary<string, object>>(text);
+        object typeValue, clientValue, targetValue, bodyValue;
+        message.TryGetValue("type", out typeValue);
+        message.TryGetValue("clientId", out clientValue);
+        message.TryGetValue("targetId", out targetValue);
+        message.TryGetValue("message", out bodyValue);
+        string type = Convert.ToString(typeValue);
+        string clientId = Convert.ToString(clientValue);
+        string targetId = Convert.ToString(targetValue);
+        string body = Convert.ToString(bodyValue);
+        if (type == "bind" && body == "DGLAB" && clientId == ClientId && targetId == TargetId)
+        {
+            IsBound = true;
+            SendEnvelope("bind", ClientId, TargetId, "200");
+        }
+    }
+
+    public void SendCommand(string command)
+    {
+        if (!IsBound || string.IsNullOrEmpty(TargetId)) throw new InvalidOperationException("DG-Lab App is not bound.");
+        SendEnvelope("msg", ClientId, TargetId, command);
+    }
+
+    private void SendEnvelope(string type, string clientId, string targetId, string message)
+    {
+        string payload = json.Serialize(new Dictionary<string, object>
+        {
+            { "type", type }, { "clientId", clientId }, { "targetId", targetId }, { "message", message }
+        });
+        lock (sync)
+        {
+            if (appStream == null) throw new IOException("DG-Lab App WebSocket is not connected.");
+            WriteTextFrame(appStream, payload);
+        }
+    }
+
+    private static string ReadHttpRequest(NetworkStream stream)
+    {
+        MemoryStream buffer = new MemoryStream();
+        int matched = 0;
+        byte[] marker = new byte[] { 13, 10, 13, 10 };
+        while (buffer.Length < 16384)
+        {
+            int value = stream.ReadByte();
+            if (value < 0) throw new EndOfStreamException();
+            buffer.WriteByte((byte)value);
+            matched = value == marker[matched] ? matched + 1 : (value == marker[0] ? 1 : 0);
+            if (matched == marker.Length) break;
+        }
+        return Encoding.ASCII.GetString(buffer.ToArray());
+    }
+
+    private static string GetHeader(string request, string name)
+    {
+        string[] lines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
+        foreach (string line in lines)
+        {
+            int colon = line.IndexOf(':');
+            if (colon > 0 && string.Equals(line.Substring(0, colon).Trim(), name, StringComparison.OrdinalIgnoreCase))
+                return line.Substring(colon + 1).Trim();
+        }
+        return null;
+    }
+
+    private static string ReadTextFrame(NetworkStream stream)
+    {
+        int first = stream.ReadByte();
+        if (first < 0) return null;
+        int second = stream.ReadByte();
+        if (second < 0) return null;
+        int opcode = first & 0x0F;
+        bool masked = (second & 0x80) != 0;
+        ulong length = (ulong)(second & 0x7F);
+        if (length == 126) length = (ulong)((stream.ReadByte() << 8) | stream.ReadByte());
+        else if (length == 127)
+        {
+            length = 0;
+            for (int i = 0; i < 8; i++) length = (length << 8) | (byte)stream.ReadByte();
+        }
+        if (length > 65536) throw new InvalidDataException("WebSocket frame is too large.");
+        byte[] mask = masked ? ReadExact(stream, 4) : null;
+        byte[] payload = ReadExact(stream, (int)length);
+        if (masked)
+            for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(payload[i] ^ mask[i % 4]);
+        if (opcode == 8) return null;
+        if (opcode == 9) { WriteFrame(stream, 10, payload); return ""; }
+        if (opcode != 1) return "";
+        return Encoding.UTF8.GetString(payload);
+    }
+
+    private static byte[] ReadExact(Stream stream, int count)
+    {
+        byte[] bytes = new byte[count];
+        int offset = 0;
+        while (offset < count)
+        {
+            int read = stream.Read(bytes, offset, count - offset);
+            if (read <= 0) throw new EndOfStreamException();
+            offset += read;
+        }
+        return bytes;
+    }
+
+    private static void WriteTextFrame(Stream stream, string text) { WriteFrame(stream, 1, Encoding.UTF8.GetBytes(text)); }
+
+    private static void WriteFrame(Stream stream, int opcode, byte[] payload)
+    {
+        MemoryStream frame = new MemoryStream();
+        frame.WriteByte((byte)(0x80 | opcode));
+        if (payload.Length < 126) frame.WriteByte((byte)payload.Length);
+        else
+        {
+            frame.WriteByte(126);
+            frame.WriteByte((byte)((payload.Length >> 8) & 0xFF));
+            frame.WriteByte((byte)(payload.Length & 0xFF));
+        }
+        frame.Write(payload, 0, payload.Length);
+        byte[] bytes = frame.ToArray();
+        stream.Write(bytes, 0, bytes.Length);
+        stream.Flush();
+    }
+
+    public void Stop()
+    {
+        stopping = true;
+        IsRunning = false;
+        IsBound = false;
+        try { if (listener != null) listener.Stop(); } catch { }
+        lock (sync)
+        {
+            try { if (appClient != null) appClient.Close(); } catch { }
+            appClient = null;
+            appStream = null;
+        }
+    }
+
+    public void Dispose() { Stop(); }
 }
 "@
 
@@ -564,57 +825,89 @@ $xaml = @"
                   </Border>
                 </StackPanel>
               </Grid>
-              <Grid Margin="0,14,0,12">
-                <Grid.ColumnDefinitions>
-                  <ColumnDefinition Width="1.05*"/>
-                  <ColumnDefinition Width="1.7*"/>
-                  <ColumnDefinition Width="*"/>
-                  <ColumnDefinition Width="*"/>
-                </Grid.ColumnDefinitions>
-                <Grid.RowDefinitions>
-                  <RowDefinition Height="Auto"/>
-                  <RowDefinition Height="Auto"/>
-                </Grid.RowDefinitions>
-                <StackPanel Margin="0,0,8,10">
-                  <TextBlock Text="连接模式" Foreground="{StaticResource Muted}"/>
-                  <ComboBox x:Name="DeviceModeCombo" SelectedIndex="0">
-                    <ComboBoxItem Content="HTTP 真实设备桥接"/>
-                    <ComboBoxItem Content="蓝牙 V3 直连"/>
-                  </ComboBox>
-                </StackPanel>
-                <StackPanel Grid.Column="1" Margin="0,0,8,10">
-                  <TextBlock Text="接口地址 / 12 位蓝牙地址" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="EndpointInput" Text="http://127.0.0.1:8080"/>
-                  <TextBlock Text="蓝牙模式：在 Windows 设置 → 蓝牙和设备 → 设备中打开设备详情，查看“蓝牙地址”；填写 12 位十六进制字符，例如 001A7DDA7113。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
-                </StackPanel>
-                <StackPanel Grid.Column="2" Margin="0,0,8,10">
-                  <TextBlock Text="A 软上限（0–200）" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="SoftLimitAInput" Text="80"/>
-                </StackPanel>
-                <StackPanel Grid.Column="3" Margin="0,0,0,10">
-                  <TextBlock Text="B 软上限（0–200）" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="SoftLimitBInput" Text="80"/>
-                </StackPanel>
-                <StackPanel Grid.Row="1" Margin="0,0,8,0">
-                  <TextBlock Text="A 频率平衡（0–255）" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="FrequencyBalanceAInput" Text="0"/>
-                </StackPanel>
-                <StackPanel Grid.Row="1" Grid.Column="1" Margin="0,0,8,0">
-                  <TextBlock Text="B 频率平衡（0–255）" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="FrequencyBalanceBInput" Text="0"/>
-                </StackPanel>
-                <StackPanel Grid.Row="1" Grid.Column="2" Margin="0,0,8,0">
-                  <TextBlock Text="A 脉宽平衡（0–255）" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="StrengthBalanceAInput" Text="0"/>
-                </StackPanel>
-                <StackPanel Grid.Row="1" Grid.Column="3">
-                  <TextBlock Text="B 脉宽平衡（0–255）" Foreground="{StaticResource Muted}"/>
-                  <TextBox x:Name="StrengthBalanceBInput" Text="0"/>
-                </StackPanel>
-              </Grid>
+              <StackPanel Margin="0,14,0,12">
+                <TextBlock Text="连接模式" Foreground="{StaticResource Muted}"/>
+                <ComboBox x:Name="DeviceModeCombo" SelectedIndex="0" Width="230" HorizontalAlignment="Left">
+                  <ComboBoxItem Content="HTTP 真实设备桥接"/>
+                  <ComboBoxItem Content="蓝牙 V3 直连"/>
+                  <ComboBoxItem Content="Socket 控制协议"/>
+                </ComboBox>
+
+                <Border x:Name="HttpConnectionPage" Background="#252525" CornerRadius="4" Padding="12" Margin="0,10,0,0">
+                  <StackPanel>
+                    <TextBlock Text="HTTP 真实设备桥接" FontWeight="Bold"/>
+                    <TextBlock Text="桥接服务地址" Foreground="{StaticResource Muted}" Margin="0,8,0,0"/>
+                    <TextBox x:Name="HttpEndpointInput" Text="http://127.0.0.1:8080"/>
+                    <TextBlock Text="填写本地或远程 HTTP 桥接服务地址，连接时会访问 /status。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                  </StackPanel>
+                </Border>
+
+                <Border x:Name="BleConnectionPage" Background="#252525" CornerRadius="4" Padding="12" Margin="0,10,0,0" Visibility="Collapsed">
+                  <StackPanel>
+                    <TextBlock Text="蓝牙 V3 直连" FontWeight="Bold"/>
+                    <TextBlock Text="12 位蓝牙地址" Foreground="{StaticResource Muted}" Margin="0,8,0,0"/>
+                    <TextBox x:Name="BleAddressInput" Text=""/>
+                    <TextBlock Text="在 Windows 设置 → 蓝牙和设备 → 设备中打开设备详情，查看“蓝牙地址”；填写 12 位十六进制字符，例如 001A7DDA7113。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,8"/>
+                    <Grid>
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                      </Grid.ColumnDefinitions>
+                      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                      <StackPanel Margin="0,0,8,8"><TextBlock Text="A 软上限（0–200）" Foreground="{StaticResource Muted}"/><TextBox x:Name="SoftLimitAInput" Text="80"/></StackPanel>
+                      <StackPanel Grid.Column="1" Margin="0,0,8,8"><TextBlock Text="B 软上限（0–200）" Foreground="{StaticResource Muted}"/><TextBox x:Name="SoftLimitBInput" Text="80"/></StackPanel>
+                      <StackPanel Grid.Column="2" Margin="0,0,8,8"><TextBlock Text="A 频率平衡（0–255）" Foreground="{StaticResource Muted}"/><TextBox x:Name="FrequencyBalanceAInput" Text="0"/></StackPanel>
+                      <StackPanel Grid.Column="3" Margin="0,0,0,8"><TextBlock Text="B 频率平衡（0–255）" Foreground="{StaticResource Muted}"/><TextBox x:Name="FrequencyBalanceBInput" Text="0"/></StackPanel>
+                      <StackPanel Grid.Row="1" Margin="0,0,8,0"><TextBlock Text="A 脉宽平衡（0–255）" Foreground="{StaticResource Muted}"/><TextBox x:Name="StrengthBalanceAInput" Text="0"/></StackPanel>
+                      <StackPanel Grid.Row="1" Grid.Column="1" Margin="0,0,8,0"><TextBlock Text="B 脉宽平衡（0–255）" Foreground="{StaticResource Muted}"/><TextBox x:Name="StrengthBalanceBInput" Text="0"/></StackPanel>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+
+                <Border x:Name="SocketConnectionPage" Background="#252525" CornerRadius="4" Padding="12" Margin="0,10,0,0" Visibility="Collapsed">
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="220"/></Grid.ColumnDefinitions>
+                    <StackPanel Margin="0,0,16,0">
+                      <TextBlock Text="DG-Lab Socket 控制协议" FontWeight="Bold"/>
+                      <TextBlock Text="服务器方式" Foreground="{StaticResource Muted}" Margin="0,8,0,0"/>
+                      <ComboBox x:Name="SocketServerModeCombo" SelectedIndex="0">
+                        <ComboBoxItem Content="在本机建立 Socket 服务器"/>
+                        <ComboBoxItem Content="连接外部 Socket 服务器"/>
+                      </ComboBox>
+                      <Grid x:Name="LocalSocketSettings" Margin="0,8,0,8">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="2*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                        <StackPanel Margin="0,0,8,0">
+                          <TextBlock Text="手机访问本机的 IP / 域名" Foreground="{StaticResource Muted}"/>
+                          <TextBox x:Name="LocalSocketHostInput"/>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1">
+                          <TextBlock Text="监听端口" Foreground="{StaticResource Muted}"/>
+                          <TextBox x:Name="LocalSocketPortInput" Text="5678"/>
+                        </StackPanel>
+                      </Grid>
+                      <StackPanel x:Name="RemoteSocketSettings" Margin="0,8,0,8" Visibility="Collapsed">
+                        <TextBlock Text="外部 WebSocket 服务器地址" Foreground="{StaticResource Muted}"/>
+                        <TextBox x:Name="SocketServerInput" Text="ws://192.168.1.100:5678"/>
+                      </StackPanel>
+                      <TextBlock Text="本地模式会监听所有网卡；请填写手机可访问的本机地址，并在 Windows 防火墙中允许该端口。启动后，用 DG-Lab App 扫描右侧二维码或手动填写生成的地址。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                      <TextBlock Text="绑定状态" Foreground="{StaticResource Muted}"/>
+                      <TextBlock x:Name="SocketBindStatusText" Text="未连接服务器" FontWeight="Bold" Margin="0,2,0,8"/>
+                      <TextBlock Text="App 手动连接地址" Foreground="{StaticResource Muted}"/>
+                      <TextBox x:Name="SocketManualAddressText" IsReadOnly="True" Margin="0,2,0,8"/>
+                      <TextBlock Text="二维码内容（可复制）" Foreground="{StaticResource Muted}"/>
+                      <TextBox x:Name="SocketQrContentText" IsReadOnly="True" TextWrapping="Wrap" MinHeight="44" VerticalScrollBarVisibility="Auto"/>
+                    </StackPanel>
+                    <Border Grid.Column="1" Background="White" Width="200" Height="200" HorizontalAlignment="Center" VerticalAlignment="Top">
+                      <Grid>
+                        <Image x:Name="SocketQrImage" Stretch="Uniform" Margin="8"/>
+                        <TextBlock x:Name="SocketQrPlaceholder" Text="连接服务器后生成二维码" Foreground="#666666" TextWrapping="Wrap" TextAlignment="Center" VerticalAlignment="Center" Margin="20"/>
+                      </Grid>
+                    </Border>
+                  </Grid>
+                </Border>
+              </StackPanel>
               <WrapPanel>
-                <Button x:Name="ConnectButton" Style="{StaticResource PrimaryButton}" Content="连接并应用安全参数" Width="170" Margin="0,0,8,0"/>
-                <Button x:Name="ApplySafetyButton" Style="{StaticResource SecondaryButton}" Content="重新应用 BF 参数" Width="145" Margin="0,0,8,0"/>
+                <Button x:Name="ConnectButton" Style="{StaticResource PrimaryButton}" Content="连接 HTTP 桥接" Width="190" Margin="0,0,8,0"/>
+                <Button x:Name="ApplySafetyButton" Style="{StaticResource SecondaryButton}" Content="重新应用 BF 参数" Width="145" Margin="0,0,8,0" Visibility="Collapsed"/>
                 <Button x:Name="DisconnectButton" Style="{StaticResource SecondaryButton}" Content="断开" Width="78" Margin="0,0,8,0"/>
                 <Button x:Name="StopButton" Style="{StaticResource DangerButton}" Content="立即停止 A/B" Width="125"/>
               </WrapPanel>
@@ -720,7 +1013,22 @@ $DeviceBadge = Find-Control "DeviceBadge"
 $LockBadge = Find-Control "LockBadge"
 $LockBadgeBorder = Find-Control "LockBadgeBorder"
 $DeviceModeCombo = Find-Control "DeviceModeCombo"
-$EndpointInput = Find-Control "EndpointInput"
+$HttpConnectionPage = Find-Control "HttpConnectionPage"
+$BleConnectionPage = Find-Control "BleConnectionPage"
+$SocketConnectionPage = Find-Control "SocketConnectionPage"
+$HttpEndpointInput = Find-Control "HttpEndpointInput"
+$BleAddressInput = Find-Control "BleAddressInput"
+$SocketServerModeCombo = Find-Control "SocketServerModeCombo"
+$LocalSocketSettings = Find-Control "LocalSocketSettings"
+$RemoteSocketSettings = Find-Control "RemoteSocketSettings"
+$LocalSocketHostInput = Find-Control "LocalSocketHostInput"
+$LocalSocketPortInput = Find-Control "LocalSocketPortInput"
+$SocketServerInput = Find-Control "SocketServerInput"
+$SocketBindStatusText = Find-Control "SocketBindStatusText"
+$SocketManualAddressText = Find-Control "SocketManualAddressText"
+$SocketQrContentText = Find-Control "SocketQrContentText"
+$SocketQrImage = Find-Control "SocketQrImage"
+$SocketQrPlaceholder = Find-Control "SocketQrPlaceholder"
 $CurrentWindowInput = Find-Control "CurrentWindowInput"
 $CurrentWindowMatchValue = Find-Control "CurrentWindowMatchValue"
 $WindowPickerCombo = Find-Control "WindowPickerCombo"
@@ -784,6 +1092,15 @@ $script:State = @{
   OutputProfile = $null
   OutputEnd = [DateTime]::MinValue
   HttpRenewAt = [DateTime]::MinValue
+  SocketClient = $null
+  SocketClientId = ""
+  SocketTargetId = ""
+  SocketServerUri = ""
+  SocketReceiveTask = $null
+  SocketReceiveBuffer = $null
+  LocalSocketServer = $null
+  LocalSocketLastError = ""
+  SocketServerMode = "local"
 }
 
 function Get-IntText($TextBox, [int]$Default) {
@@ -1075,6 +1392,10 @@ function Update-View {
   } elseif ($script:State.DeviceMode -eq "ble") {
     $DeviceValue.Text = if ($script:State.Connected) { "蓝牙设备已连接" } else { "蓝牙设备未连接" }
     $DeviceBadge.Text = if ($script:State.Connected) { "蓝牙 V3 直连" } else { "蓝牙未连接" }
+  } elseif ($script:State.DeviceMode -eq "socket") {
+    $registered = -not [string]::IsNullOrWhiteSpace($script:State.SocketClientId)
+    $DeviceValue.Text = if ($script:State.Connected) { "Socket App 已绑定" } elseif ($registered) { "等待 App 绑定" } else { "Socket 未连接" }
+    $DeviceBadge.Text = if ($script:State.Connected) { "Socket 控制协议" } elseif ($registered) { "Socket 已注册" } else { "Socket 未连接" }
   }
   $LockBadge.Text = if ($script:State.Locked) { "已锁定" } else { "未锁定" }
   $UnlockButton.IsEnabled = $script:State.Locked
@@ -1272,7 +1593,7 @@ function Initialize-BleTypes {
 function Invoke-BleConnect {
   try {
     Initialize-BleTypes
-    $address = Convert-BleAddress $EndpointInput.Text
+    $address = Convert-BleAddress $BleAddressInput.Text
     $deviceOp = [Windows.Devices.Bluetooth.BluetoothLEDevice]::FromBluetoothAddressAsync($address)
     $device = Await-WinRt $deviceOp ([Windows.Devices.Bluetooth.BluetoothLEDevice])
     if ($null -eq $device) {
@@ -1367,8 +1688,248 @@ function Invoke-BleActivate($Profile) {
   }
 }
 
+function Initialize-QrCoder {
+  try {
+    [void][QRCoder.QRCodeGenerator]
+    return
+  } catch {
+    $localDll = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { "" } else { Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) "vendor\QRCoder\QRCoder.dll" }
+    if (-not [string]::IsNullOrWhiteSpace($localDll) -and (Test-Path $localDll)) {
+      Add-Type -Path $localDll
+    } else {
+      [void][Reflection.Assembly]::Load("QRCoder")
+    }
+  }
+}
+
+function Set-SocketQrCode([string]$Content) {
+  Initialize-QrCoder
+  $generator = New-Object QRCoder.QRCodeGenerator
+  $data = $generator.CreateQrCode($Content, [QRCoder.QRCodeGenerator+ECCLevel]::M)
+  $png = New-Object QRCoder.PngByteQRCode $data
+  $bytes = $png.GetGraphic(6)
+  $stream = New-Object IO.MemoryStream (,$bytes)
+  $bitmap = New-Object Windows.Media.Imaging.BitmapImage
+  $bitmap.BeginInit()
+  $bitmap.CacheOption = [Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+  $bitmap.StreamSource = $stream
+  $bitmap.EndInit()
+  $bitmap.Freeze()
+  $SocketQrImage.Source = $bitmap
+  $SocketQrPlaceholder.Visibility = [Windows.Visibility]::Collapsed
+  $stream.Dispose()
+  $png.Dispose()
+  $data.Dispose()
+  $generator.Dispose()
+}
+
+function Set-SocketBindingInfo([string]$ServerUri, [string]$ClientId) {
+  $server = $ServerUri.TrimEnd("/")
+  $manualAddress = "$server/$ClientId"
+  $qr = "https://www.dungeon-lab.com/app-download.php#DGLAB-SOCKET#$manualAddress"
+  $SocketManualAddressText.Text = $manualAddress
+  $SocketQrContentText.Text = $qr
+  Set-SocketQrCode $qr
+}
+
+function Reset-SocketConnection {
+  if ($null -ne $script:State.SocketClient) {
+    try { $script:State.SocketClient.Abort() } catch {}
+    try { $script:State.SocketClient.Dispose() } catch {}
+  }
+  if ($null -ne $script:State.LocalSocketServer) {
+    try { $script:State.LocalSocketServer.Stop() } catch {}
+    try { $script:State.LocalSocketServer.Dispose() } catch {}
+  }
+  $script:State.SocketClient = $null
+  $script:State.LocalSocketServer = $null
+  $script:State.LocalSocketLastError = ""
+  $script:State.SocketClientId = ""
+  $script:State.SocketTargetId = ""
+  $script:State.SocketServerUri = ""
+  $script:State.SocketReceiveTask = $null
+  $script:State.SocketReceiveBuffer = $null
+  $script:State.Connected = $false
+  $SocketQrContentText.Text = ""
+  $SocketManualAddressText.Text = ""
+  $SocketQrImage.Source = $null
+  $SocketQrPlaceholder.Visibility = [Windows.Visibility]::Visible
+  $SocketBindStatusText.Text = "未连接服务器"
+}
+
+function Start-SocketReceive {
+  if ($null -eq $script:State.SocketClient -or $script:State.SocketClient.State -ne [System.Net.WebSockets.WebSocketState]::Open) { return }
+  $buffer = New-Object byte[] 4096
+  $segment = New-Object 'System.ArraySegment[byte]' (,$buffer)
+  $script:State.SocketReceiveBuffer = $buffer
+  $script:State.SocketReceiveTask = $script:State.SocketClient.ReceiveAsync($segment, [Threading.CancellationToken]::None)
+}
+
+function Update-SocketReceive {
+  $task = $script:State.SocketReceiveTask
+  if ($null -eq $task -or -not $task.IsCompleted) { return }
+  try {
+    $result = $task.Result
+    if ($result.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
+      throw "Socket 服务器已关闭连接"
+    }
+    $json = [Text.Encoding]::UTF8.GetString($script:State.SocketReceiveBuffer, 0, $result.Count)
+    $message = $json | ConvertFrom-Json
+    if ($message.type -eq "bind" -and $message.message -eq "targetId") {
+      $script:State.SocketClientId = [string]$message.clientId
+      Set-SocketBindingInfo $script:State.SocketServerUri $script:State.SocketClientId
+      $SocketBindStatusText.Text = "服务器已注册，等待 App 扫码或手动连接"
+      Add-Log "Socket 终端已注册，等待 App 绑定：$($script:State.SocketClientId)"
+    } elseif ($message.type -eq "bind" -and [string]$message.message -eq "200" -and [string]$message.clientId -eq $script:State.SocketClientId) {
+      $script:State.SocketTargetId = [string]$message.targetId
+      $script:State.Connected = $true
+      $SocketBindStatusText.Text = "App 已绑定，可以发送控制指令"
+      Add-Log "Socket App 已绑定：$($script:State.SocketTargetId)"
+    } elseif ($message.type -eq "break") {
+      $script:State.Connected = $false
+      $script:State.SocketTargetId = ""
+      $SocketBindStatusText.Text = "App 已断开，请重新扫码绑定"
+      Add-Log "Socket App 已断开"
+    }
+    Start-SocketReceive
+  } catch {
+    Add-Log "Socket 接收失败：$($_.Exception.Message)"
+    Reset-SocketConnection
+  }
+}
+
+function Get-PreferredLocalIpv4Address {
+  $addresses = [Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) | Where-Object {
+    $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and -not [Net.IPAddress]::IsLoopback($_)
+  }
+  $preferred = $addresses | Where-Object { $_.ToString() -match '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)' } | Select-Object -First 1
+  if ($null -eq $preferred) { $preferred = $addresses | Select-Object -First 1 }
+  if ($null -eq $preferred) { return "127.0.0.1" }
+  return $preferred.ToString()
+}
+
+function Invoke-LocalSocketStart {
+  try {
+    Reset-SocketConnection
+    $hostText = $LocalSocketHostInput.Text.Trim()
+    if ([string]::IsNullOrWhiteSpace($hostText)) { throw "请填写手机可访问的本机 IP 或域名。" }
+    $port = Get-ClampedInt $LocalSocketPortInput 5678 1 65535
+    $server = New-Object LocalDglabSocketServer
+    $server.Start($port)
+    $script:State.LocalSocketServer = $server
+    $script:State.SocketClientId = $server.ClientId
+    $script:State.SocketServerUri = "ws://$hostText`:$port"
+    Set-SocketBindingInfo $script:State.SocketServerUri $script:State.SocketClientId
+    $SocketBindStatusText.Text = "本地服务器已启动，等待 App 扫码或手动连接"
+    Add-Log "本地 Socket 服务器已启动：0.0.0.0:$port；对外地址 $($script:State.SocketServerUri)"
+  } catch {
+    Reset-SocketConnection
+    Add-Log "本地 Socket 服务器启动失败：$($_.Exception.Message)"
+  }
+}
+
+function Update-LocalSocketServer {
+  $server = $script:State.LocalSocketServer
+  if ($null -eq $server) { return }
+  if (-not [string]::IsNullOrWhiteSpace($server.LastError) -and $server.LastError -ne $script:State.LocalSocketLastError) {
+    $script:State.LocalSocketLastError = $server.LastError
+    Add-Log "本地 Socket 服务器错误：$($server.LastError)"
+  }
+  if ($server.IsBound -and -not $script:State.Connected) {
+    $script:State.SocketTargetId = $server.TargetId
+    $script:State.Connected = $true
+    $SocketBindStatusText.Text = "App 已绑定本地服务器，可以发送控制指令"
+    Add-Log "Socket App 已绑定本地服务器：$($script:State.SocketTargetId)"
+  } elseif (-not $server.IsBound -and $script:State.Connected) {
+    $script:State.Connected = $false
+    $script:State.SocketTargetId = ""
+    $SocketBindStatusText.Text = "App 已断开，请重新扫码绑定"
+    Add-Log "Socket App 已从本地服务器断开"
+  }
+}
+
+function Invoke-RemoteSocketConnect {
+  try {
+    Reset-SocketConnection
+    $text = $SocketServerInput.Text.Trim().TrimEnd("/")
+    $uri = $null
+    if (-not [Uri]::TryCreate($text, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @("ws", "wss")) {
+      throw "Socket 模式需要 ws:// 或 wss:// 服务器地址，例如 ws://192.168.1.10:5678。"
+    }
+    $client = New-Object System.Net.WebSockets.ClientWebSocket
+    $client.ConnectAsync($uri, [Threading.CancellationToken]::None).Wait()
+    if ($client.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+      throw "Socket 连接未进入 Open 状态。"
+    }
+    $script:State.SocketClient = $client
+    $script:State.SocketServerUri = $text
+    $SocketBindStatusText.Text = "服务器已连接，正在注册终端…"
+    Start-SocketReceive
+    Add-Log "Socket 服务器已连接，等待注册消息：$text"
+  } catch {
+    Reset-SocketConnection
+    Add-Log "Socket 连接失败：$($_.Exception.Message)"
+  }
+}
+
+function Invoke-SocketConnect {
+  if ($script:State.SocketServerMode -eq "local") {
+    Invoke-LocalSocketStart
+  } else {
+    Invoke-RemoteSocketConnect
+  }
+}
+
+function Invoke-SocketSend([string]$Command) {
+  if (-not $script:State.Connected -or [string]::IsNullOrWhiteSpace($script:State.SocketClientId) -or [string]::IsNullOrWhiteSpace($script:State.SocketTargetId)) {
+    throw "Socket App 尚未完成绑定"
+  }
+  if ($null -ne $script:State.LocalSocketServer) {
+    $script:State.LocalSocketServer.SendCommand($Command)
+    return
+  }
+  $payload = @{
+    type = "msg"
+    clientId = $script:State.SocketClientId
+    targetId = $script:State.SocketTargetId
+    message = $Command
+  } | ConvertTo-Json -Compress
+  $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
+  $segment = New-Object 'System.ArraySegment[byte]' (,$bytes)
+  $script:State.SocketClient.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait()
+}
+
+function Invoke-SocketStop {
+  try {
+    Invoke-SocketSend "clear-1"
+    Invoke-SocketSend "clear-2"
+    Invoke-SocketSend "strength-1+2+0"
+    Invoke-SocketSend "strength-2+2+0"
+    Add-Log "已发送 Socket 停止指令"
+    return $true
+  } catch {
+    Add-Log "Socket 停止失败：$($_.Exception.Message)"
+    return $false
+  }
+}
+
+function Invoke-SocketActivate($Profile) {
+  try {
+    $a = if ($Profile.Channel -in @("A", "both")) { $Profile.AStrength } else { 0 }
+    $b = if ($Profile.Channel -in @("B", "both")) { $Profile.BStrength } else { 0 }
+    Invoke-SocketSend "clear-1"
+    Invoke-SocketSend "clear-2"
+    Invoke-SocketSend "strength-1+2+$a"
+    Invoke-SocketSend "strength-2+2+$b"
+    return $true
+  } catch {
+    Add-Log "Socket 触发失败：$($_.Exception.Message)"
+    return $false
+  }
+}
+
 function Get-EndpointUrl($Action) {
-  $base = $EndpointInput.Text.Trim().TrimEnd("/")
+  $base = $HttpEndpointInput.Text.Trim().TrimEnd("/")
   if ([string]::IsNullOrWhiteSpace($base)) {
     throw "接口地址不能为空"
   }
@@ -1381,6 +1942,10 @@ function Get-EndpointUrl($Action) {
 function Invoke-DeviceStatus {
   if ($script:State.DeviceMode -eq "ble") {
     Invoke-BleConnect
+    return
+  }
+  if ($script:State.DeviceMode -eq "socket") {
+    Invoke-SocketConnect
     return
   }
 
@@ -1403,6 +1968,9 @@ function Invoke-DeviceStop {
   $script:State.HttpRenewAt = [DateTime]::MinValue
   if ($script:State.DeviceMode -eq "ble") {
     return Invoke-BleStop
+  }
+  if ($script:State.DeviceMode -eq "socket") {
+    return Invoke-SocketStop
   }
 
   try {
@@ -1449,6 +2017,9 @@ function Invoke-HttpActivate($Profile) {
 function Invoke-DeviceActivate($Profile) {
   if ($script:State.DeviceMode -eq "ble") {
     return Invoke-BleActivate $Profile
+  }
+  if ($script:State.DeviceMode -eq "socket") {
+    return Invoke-SocketActivate $Profile
   }
   return Invoke-HttpActivate $Profile
 }
@@ -1559,19 +2130,49 @@ $UnlockButton.Add_Click({
 })
 
 $ManualTestButton.Add_Click({ Invoke-Trigger "手动测试" })
+$SocketServerModeCombo.Add_SelectionChanged({
+  if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
+  if ($SocketServerModeCombo.SelectedIndex -eq 0) {
+    $script:State.SocketServerMode = "local"
+    $LocalSocketSettings.Visibility = [Windows.Visibility]::Visible
+    $RemoteSocketSettings.Visibility = [Windows.Visibility]::Collapsed
+    $ConnectButton.Content = "启动本地服务器并生成二维码"
+    Add-Log "Socket 已切换到本地服务器模式"
+  } else {
+    $script:State.SocketServerMode = "remote"
+    $LocalSocketSettings.Visibility = [Windows.Visibility]::Collapsed
+    $RemoteSocketSettings.Visibility = [Windows.Visibility]::Visible
+    $ConnectButton.Content = "连接外部服务器并生成二维码"
+    Add-Log "Socket 已切换到外部服务器模式"
+  }
+  Update-View
+})
 $DeviceModeCombo.Add_SelectionChanged({
   if ($script:State.OutputActive -and $script:State.Connected) { Invoke-DeviceStop | Out-Null }
-  if ($DeviceModeCombo.SelectedIndex -eq 1) {
+  if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
+  $HttpConnectionPage.Visibility = [Windows.Visibility]::Collapsed
+  $BleConnectionPage.Visibility = [Windows.Visibility]::Collapsed
+  $SocketConnectionPage.Visibility = [Windows.Visibility]::Collapsed
+  if ($DeviceModeCombo.SelectedIndex -eq 2) {
+    $script:State.DeviceMode = "socket"
+    $script:State.Connected = $false
+    $SocketConnectionPage.Visibility = [Windows.Visibility]::Visible
+    $ConnectButton.Content = if ($script:State.SocketServerMode -eq "local") { "启动本地服务器并生成二维码" } else { "连接外部服务器并生成二维码" }
+    $ApplySafetyButton.Visibility = [Windows.Visibility]::Collapsed
+    Add-Log "已切换到 Socket 控制协议模式"
+  } elseif ($DeviceModeCombo.SelectedIndex -eq 1) {
     $script:State.DeviceMode = "ble"
     $script:State.Connected = $false
-    $EndpointInput.Text = "输入 12 位十六进制蓝牙地址"
+    $BleConnectionPage.Visibility = [Windows.Visibility]::Visible
+    $ConnectButton.Content = "连接并应用安全参数"
+    $ApplySafetyButton.Visibility = [Windows.Visibility]::Visible
     Add-Log "已切换到蓝牙 V3 直连模式"
   } else {
     $script:State.DeviceMode = "http"
     $script:State.Connected = $false
-    if ($EndpointInput.Text -match "47L|^[0-9A-Fa-f: -]{12,}$") {
-      $EndpointInput.Text = "http://127.0.0.1:8080"
-    }
+    $HttpConnectionPage.Visibility = [Windows.Visibility]::Visible
+    $ConnectButton.Content = "连接 HTTP 桥接"
+    $ApplySafetyButton.Visibility = [Windows.Visibility]::Collapsed
     Add-Log "已切换到 HTTP 真实设备桥接模式"
   }
   Update-View
@@ -1580,6 +2181,7 @@ $ConnectButton.Add_Click({ Invoke-DeviceStatus; Update-View })
 $ApplySafetyButton.Add_Click({ Apply-BleSafetySettings | Out-Null; Update-View })
 $DisconnectButton.Add_Click({
   if ($script:State.Connected) { Invoke-DeviceStop | Out-Null }
+  if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
   $script:State.Connected = $false
   $script:Ble.WriteCharacteristic = $null
   $script:Ble.Service = $null
@@ -1658,6 +2260,9 @@ $bleOutputTimer.Start()
 $timer = New-Object Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds(1)
 $timer.Add_Tick({
+  if ($script:State.DeviceMode -eq "socket") {
+    if ($null -ne $script:State.LocalSocketServer) { Update-LocalSocketServer } else { Update-SocketReceive }
+  }
   # 当前前台窗口展示与专注会话解耦，任何状态下都保持实时更新。
   $currentWindowInfo = Refresh-CurrentWindow
   if ($script:State.Running -and -not $script:State.Paused -and -not $script:State.Locked) {
@@ -1717,7 +2322,7 @@ $timer.Add_Tick({
       $script:State.OutputActive = $false
     }
   }
-  if ($script:State.OutputActive -and -not $script:State.OutputHoldUntilWhitelist -and $script:State.DeviceMode -eq "http" -and (Get-Date) -ge $script:State.OutputEnd) {
+  if ($script:State.OutputActive -and -not $script:State.OutputHoldUntilWhitelist -and $script:State.DeviceMode -in @("http", "socket") -and (Get-Date) -ge $script:State.OutputEnd) {
     $script:State.OutputActive = $false
     $script:State.OutputProfile = $null
   }
@@ -1730,9 +2335,11 @@ $window.Add_Closing({
   if ($script:State.Connected) {
     Invoke-DeviceStop | Out-Null
   }
+  if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
 })
 
 $timer.Start()
+$LocalSocketHostInput.Text = Get-PreferredLocalIpv4Address
 Initialize-ScopeLists
 Show-AppPage "dashboard"
 Refresh-CurrentWindow | Out-Null
