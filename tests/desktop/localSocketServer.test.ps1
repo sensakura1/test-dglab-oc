@@ -28,12 +28,32 @@ $server = New-Object LocalDglabSocketServer
 $client = New-Object Net.WebSockets.ClientWebSocket
 try {
   $server.Start($port)
-  $uri = New-Object Uri "ws://127.0.0.1:$port/$($server.ClientId)"
+  $wrongClient = New-Object Net.WebSockets.ClientWebSocket
+  try {
+    $wrongPathRejected = $false
+    try { $wrongClient.ConnectAsync((New-Object Uri "ws://127.0.0.1:$port/wrong-client-id"), [Threading.CancellationToken]::None).Wait() }
+    catch { $wrongPathRejected = $true }
+    if (-not $wrongPathRejected) { throw "本地 Socket 服务端接受了错误的二维码客户端 ID。" }
+  } finally {
+    try { $wrongClient.Abort() } catch {}
+    try { $wrongClient.Dispose() } catch {}
+  }
+
+  # DG-Lab App may connect to the server root even when the QR payload contains
+  # /<clientId>. Pairing remains authenticated by the clientId in the bind frame.
+  $uri = New-Object Uri "ws://127.0.0.1:$port/"
   $client.ConnectAsync($uri, [Threading.CancellationToken]::None).Wait()
 
   $registration = (Receive-WebSocketText $client) | ConvertFrom-Json
   if ($registration.type -ne "bind" -or $registration.message -ne "targetId") {
     throw "服务端没有发送标准注册消息。"
+  }
+
+  # The official Socket server does not drop an App merely because its bind
+  # frame takes more than five seconds to arrive.
+  Start-Sleep -Milliseconds 5200
+  if ($client.State -ne [Net.WebSockets.WebSocketState]::Open -or -not [string]::IsNullOrWhiteSpace($server.LastError)) {
+    throw "本地 Socket 服务端在等待 App 绑定时错误触发了读取超时：$($server.LastError)"
   }
 
   $bind = @{
@@ -53,8 +73,8 @@ try {
 
   $strengthReport = @{
     type = "msg"
-    clientId = $registration.clientId
-    targetId = $server.ClientId
+    clientId = $server.ClientId
+    targetId = $registration.clientId
     message = "strength-12+24+30+40"
   } | ConvertTo-Json -Compress
   $reportBytes = [Text.Encoding]::UTF8.GetBytes($strengthReport)

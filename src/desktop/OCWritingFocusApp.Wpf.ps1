@@ -140,8 +140,19 @@ public sealed class LocalDglabSocketServer : IDisposable
             NetworkStream stream = client.GetStream();
             string request = ReadHttpRequest(stream);
             string[] requestLines = request.Split(new[] { "\r\n" }, StringSplitOptions.None);
-            string expectedRequestLine = "GET /" + ClientId + " HTTP/1.1";
-            if (requestLines.Length == 0 || !string.Equals(requestLines[0], expectedRequestLine, StringComparison.Ordinal))
+            string[] requestParts = requestLines.Length == 0 ? new string[0] : requestLines[0].Split(' ');
+            string requestPath = requestParts.Length == 3 ? requestParts[1] : "";
+            if (requestPath.IndexOf('?') >= 0 || requestPath.IndexOf('#') >= 0)
+                throw new InvalidDataException("WebSocket registration path must not contain a query or fragment.");
+            try { requestPath = Uri.UnescapeDataString(requestPath); }
+            catch (UriFormatException) { throw new InvalidDataException("Invalid WebSocket registration path encoding."); }
+            requestPath = requestPath.TrimEnd('/');
+            string expectedPath = "/" + ClientId;
+            bool acceptedPath = string.IsNullOrEmpty(requestPath) ||
+                string.Equals(requestPath, expectedPath, StringComparison.OrdinalIgnoreCase);
+            if (requestParts.Length != 3 || !string.Equals(requestParts[0], "GET", StringComparison.Ordinal) ||
+                !string.Equals(requestParts[2], "HTTP/1.1", StringComparison.OrdinalIgnoreCase) ||
+                !acceptedPath)
                 throw new InvalidDataException("Invalid WebSocket registration path.");
             string upgrade = GetHeader(request, "Upgrade");
             string connection = GetHeader(request, "Connection");
@@ -159,13 +170,13 @@ public sealed class LocalDglabSocketServer : IDisposable
             string response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n";
             byte[] responseBytes = Encoding.ASCII.GetBytes(response);
             stream.Write(responseBytes, 0, responseBytes.Length);
+            LastError = "";
 
             lock (sync)
             {
                 if (appClient != null) { try { appClient.Close(); } catch { } }
                 appClient = client;
                 appClient.SendTimeout = 1000;
-                appClient.ReceiveTimeout = 5000;
                 appStream = stream;
                 TargetId = Guid.NewGuid().ToString();
                 IsBound = false;
@@ -218,7 +229,7 @@ public sealed class LocalDglabSocketServer : IDisposable
             IsBound = true;
             SendEnvelope("bind", ClientId, TargetId, "200");
         }
-        else if (type == "msg" && IsBound && clientId == TargetId && targetId == ClientId)
+        else if (type == "msg" && IsBound && clientId == ClientId && targetId == TargetId)
         {
             Match strength = Regex.Match(body ?? "", @"^strength-(\d{1,3})\+(\d{1,3})\+(\d{1,3})\+(\d{1,3})$", RegexOptions.IgnoreCase);
             if (strength.Success)
@@ -2572,8 +2583,8 @@ function Update-SocketReceive {
       $SocketBindStatusText.Text = "App 已绑定，可以发送控制指令"
       Add-Log "Socket App 已绑定：$($script:State.SocketTargetId)"
     } elseif ($message.type -eq "msg" -and $script:State.Connected -and
-      [string]$message.clientId -eq $script:State.SocketTargetId -and
-      [string]$message.targetId -eq $script:State.SocketClientId) {
+      [string]$message.clientId -eq $script:State.SocketClientId -and
+      [string]$message.targetId -eq $script:State.SocketTargetId) {
       [void](Try-ApplySocketStrengthMessage ([string]$message.message))
     } elseif ($message.type -eq "break") {
       $script:State.Connected = $false
@@ -2591,6 +2602,30 @@ function Update-SocketReceive {
 }
 
 function Get-PreferredLocalIpv4Address {
+  $adapters = [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | Where-Object {
+    $_.OperationalStatus -eq [Net.NetworkInformation.OperationalStatus]::Up -and
+    $_.NetworkInterfaceType -ne [Net.NetworkInformation.NetworkInterfaceType]::Loopback
+  }
+  $adapters = $adapters | Sort-Object @{ Expression = {
+    if ($_.NetworkInterfaceType -eq [Net.NetworkInformation.NetworkInterfaceType]::Wireless80211) { 0 }
+    elseif ($_.NetworkInterfaceType -eq [Net.NetworkInformation.NetworkInterfaceType]::Ethernet) { 1 }
+    else { 2 }
+  } }
+  foreach ($adapter in $adapters) {
+    try {
+      $properties = $adapter.GetIPProperties()
+      $hasIpv4Gateway = $null -ne ($properties.GatewayAddresses | Where-Object {
+        $_.Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and $_.Address.ToString() -ne "0.0.0.0"
+      } | Select-Object -First 1)
+      if (-not $hasIpv4Gateway) { continue }
+      foreach ($unicast in $properties.UnicastAddresses) {
+        $address = $unicast.Address
+        if ($address.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { continue }
+        $probeUri = New-Object Uri "ws://$($address.ToString())"
+        if (Test-TrustedPlaintextHost $probeUri) { return $address.ToString() }
+      }
+    } catch {}
+  }
   $addresses = [Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) | Where-Object {
     $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and -not [Net.IPAddress]::IsLoopback($_)
   }
