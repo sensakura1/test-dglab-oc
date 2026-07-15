@@ -2,6 +2,7 @@
 Add-Type -AssemblyName PresentationCore
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Web.Extensions
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Add-Type -ReferencedAssemblies @("System.dll", "System.Core.dll", "System.Web.Extensions.dll") -TypeDefinition @"
 using System;
 using System.Collections.Generic;
@@ -93,10 +94,18 @@ public sealed class LocalDglabSocketServer : IDisposable
 
     public void Start(int port)
     {
+        Start("127.0.0.1", port);
+    }
+
+    public void Start(string bindAddress, int port)
+    {
         if (IsRunning) throw new InvalidOperationException("Server is already running.");
+        IPAddress address;
+        if (string.Equals(bindAddress, "localhost", StringComparison.OrdinalIgnoreCase)) address = IPAddress.Loopback;
+        else if (!IPAddress.TryParse(bindAddress, out address)) throw new ArgumentException("A numeric local bind address is required.", "bindAddress");
         Port = port;
         stopping = false;
-        listener = new TcpListener(IPAddress.Any, port);
+        listener = new TcpListener(address, port);
         listener.Start();
         IsRunning = true;
         acceptThread = new Thread(AcceptLoop);
@@ -786,8 +795,9 @@ $xaml = @"
               <TextBlock x:Name="DeviceBadge" Text="HTTP 桥接" Foreground="#66B3FF" FontWeight="Bold"/>
             </Border>
              <Border x:Name="LockBadgeBorder" Background="#25384A" CornerRadius="3" Padding="10,5" Margin="0,0,8,0">
-              <TextBlock x:Name="LockBadge" Text="未锁定" Foreground="#66B3FF" FontWeight="Bold"/>
-            </Border>
+               <TextBlock x:Name="LockBadge" Text="未锁定" Foreground="#66B3FF" FontWeight="Bold"/>
+             </Border>
+            <Button x:Name="FloatingMonitorButton" Style="{StaticResource SecondaryButton}" Content="悬浮监控" Width="94" Height="34" Margin="0,0,8,0"/>
             <Button x:Name="EmergencyButton" Style="{StaticResource DangerButton}" Content="急停" Width="86" Height="34" FontWeight="Bold"/>
           </StackPanel>
         </Grid>
@@ -1042,7 +1052,7 @@ $xaml = @"
                     <TextBlock Text="HTTP 真实设备桥接" FontWeight="Bold"/>
                     <TextBlock Text="桥接服务地址" Foreground="{StaticResource Muted}" Margin="0,8,0,0"/>
                     <TextBox x:Name="HttpEndpointInput" Text="http://127.0.0.1:8080"/>
-                    <TextBlock Text="填写本地或远程 HTTP 桥接服务地址，连接时会访问 /status。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                    <TextBlock Text="远程地址必须使用 HTTPS；HTTP 仅允许回环或私有/链路本地 IP。连接时会访问 /status。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
                     <Grid Margin="0,8,0,0">
                       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                       <StackPanel Margin="0,0,8,0"><TextBlock Text="A 手动上限（0–200）" Foreground="{StaticResource Muted}"/><TextBox x:Name="HttpLimitAInput" Text="80"/></StackPanel>
@@ -1096,8 +1106,9 @@ $xaml = @"
                       <StackPanel x:Name="RemoteSocketSettings" Margin="0,8,0,8" Visibility="Collapsed">
                         <TextBlock Text="外部 WebSocket 服务器地址" Foreground="{StaticResource Muted}"/>
                         <TextBox x:Name="SocketServerInput" Text="ws://192.168.1.100:5678"/>
+                        <TextBlock Text="远程服务器必须使用 WSS；WS 仅允许回环或私有/链路本地 IP。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,4,0,0"/>
                       </StackPanel>
-                      <TextBlock Text="本地模式会监听所有网卡；请填写手机可访问的本机地址，并在 Windows 防火墙中允许该端口。启动后，用 DG-Lab App 扫描右侧二维码或手动填写生成的地址。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8"/>
+                      <TextBlock Text="本地模式仅监听所填的回环或私有/链路本地 IP；请在 Windows 防火墙中仅对专用网络放行。启动后，用 DG-Lab App 扫描右侧二维码或手动填写生成的地址。" Foreground="{StaticResource Muted}" FontSize="11" TextWrapping="Wrap" Margin="0,0,0,8"/>
                       <TextBlock Text="绑定状态" Foreground="{StaticResource Muted}"/>
                       <TextBlock x:Name="SocketBindStatusText" Text="未连接服务器" FontWeight="Bold" Margin="0,2,0,8"/>
                       <TextBlock Text="App 当前强度 / 上限" Foreground="{StaticResource Muted}"/>
@@ -1294,6 +1305,7 @@ $EndButton = Find-Control "EndButton"
 $UnlockButton = Find-Control "UnlockButton"
 $EmergencyButton = Find-Control "EmergencyButton"
 $ManualTestButton = Find-Control "ManualTestButton"
+$FloatingMonitorButton = Find-Control "FloatingMonitorButton"
 $ConnectButton = Find-Control "ConnectButton"
 $ApplySafetyButton = Find-Control "ApplySafetyButton"
 $DisconnectButton = Find-Control "DisconnectButton"
@@ -1349,6 +1361,13 @@ $script:State = @{
   SocketServerMode = "local"
 }
 
+$script:FloatingMonitorWindow = $null
+$script:FloatingStrengthAValue = $null
+$script:FloatingStrengthBValue = $null
+$script:FloatingDurationValue = $null
+$script:FloatingRemainingValue = $null
+$script:FloatingSourceValue = $null
+
 function Get-IntText($TextBox, [int]$Default) {
   $value = 0
   if ([int]::TryParse($TextBox.Text, [ref]$value)) { return $value }
@@ -1358,6 +1377,107 @@ function Get-IntText($TextBox, [int]$Default) {
 function Format-Seconds([int]$Seconds) {
   if ($Seconds -lt 0) { $Seconds = 0 }
   return "{0:00}:{1:00}" -f [Math]::Floor($Seconds / 60), ($Seconds % 60)
+}
+
+function Get-CurrentOutputDurationSeconds {
+  if ($script:State.OutputActive -and $null -ne $script:State.OutputProfile) {
+    $milliseconds = if ($script:State.OutputHoldUntilWhitelist) {
+      [int]$script:State.OutputProfile.MaxContinuousMs
+    } else {
+      [int]$script:State.OutputProfile.DurationMs
+    }
+    return [Math]::Max(1, [int][Math]::Ceiling($milliseconds / 1000.0))
+  }
+  return (Get-ClampedInt $DurationInput 5 1 30)
+}
+
+function Update-FloatingMonitor {
+  if ($null -eq $script:FloatingMonitorWindow) { return }
+  if ($script:State.ActualStrengthKnown) {
+    $script:FloatingStrengthAValue.Text = [string]$script:State.ActualStrengthA
+    $script:FloatingStrengthBValue.Text = [string]$script:State.ActualStrengthB
+  } else {
+    $script:FloatingStrengthAValue.Text = "--"
+    $script:FloatingStrengthBValue.Text = "--"
+  }
+  $durationSeconds = Get-CurrentOutputDurationSeconds
+  $script:FloatingDurationValue.Text = "本次持续：$durationSeconds 秒"
+  if ($script:State.OutputActive) {
+    $remaining = [Math]::Max(0, ($script:State.OutputEnd - (Get-Date)).TotalSeconds)
+    $script:FloatingRemainingValue.Text = ("剩余时间：{0:0.0} 秒" -f $remaining)
+  } else {
+    $script:FloatingRemainingValue.Text = "剩余时间：未输出"
+  }
+  $script:FloatingSourceValue.Text = $script:State.ActualStrengthSource
+}
+
+function New-FloatingMonitorWindow {
+  $floatingXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="A/B 强度监控" Width="330" Height="190" MinWidth="330" MinHeight="190"
+        WindowStyle="ToolWindow" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
+        WindowStartupLocation="CenterOwner" Background="#202020">
+  <Border Background="#202020" BorderBrush="#2D8CFF" BorderThickness="1" CornerRadius="4" Padding="14">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <TextBlock Text="A/B 通道实时监控" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontSize="15" FontWeight="Bold"/>
+      <Grid Grid.Row="1" Margin="0,10,0,8">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <Border Background="#303030" CornerRadius="3" Padding="12" Margin="0,0,6,0">
+          <StackPanel><TextBlock Text="通道 A" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI"/><TextBlock x:Name="FloatingStrengthAValue" Text="--" Foreground="#66B3FF" FontFamily="Microsoft YaHei UI" FontSize="28" FontWeight="Bold" HorizontalAlignment="Center"/></StackPanel>
+        </Border>
+        <Border Grid.Column="1" Background="#303030" CornerRadius="3" Padding="12" Margin="6,0,0,0">
+          <StackPanel><TextBlock Text="通道 B" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI"/><TextBlock x:Name="FloatingStrengthBValue" Text="--" Foreground="#66B3FF" FontFamily="Microsoft YaHei UI" FontSize="28" FontWeight="Bold" HorizontalAlignment="Center"/></StackPanel>
+        </Border>
+      </Grid>
+      <Grid Grid.Row="2">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock x:Name="FloatingDurationValue" Text="本次持续：5 秒" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontWeight="Bold"/>
+        <TextBlock x:Name="FloatingRemainingValue" Grid.Column="1" Text="剩余时间：未输出" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontWeight="Bold" HorizontalAlignment="Right"/>
+      </Grid>
+      <TextBlock x:Name="FloatingSourceValue" Grid.Row="3" Text="未连接" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI" FontSize="10" TextTrimming="CharacterEllipsis" Margin="0,7,0,0"/>
+    </Grid>
+  </Border>
+</Window>
+"@
+  $reader = New-Object Xml.XmlNodeReader ([xml]$floatingXaml)
+  $floatingWindow = [Windows.Markup.XamlReader]::Load($reader)
+  if ($window.IsVisible) { $floatingWindow.Owner = $window }
+  $script:FloatingStrengthAValue = $floatingWindow.FindName("FloatingStrengthAValue")
+  $script:FloatingStrengthBValue = $floatingWindow.FindName("FloatingStrengthBValue")
+  $script:FloatingDurationValue = $floatingWindow.FindName("FloatingDurationValue")
+  $script:FloatingRemainingValue = $floatingWindow.FindName("FloatingRemainingValue")
+  $script:FloatingSourceValue = $floatingWindow.FindName("FloatingSourceValue")
+  $floatingWindow.Add_MouseLeftButtonDown({
+    param($sender, $eventArgs)
+    if ($eventArgs.ButtonState -eq [Windows.Input.MouseButtonState]::Pressed) {
+      try { $sender.DragMove() } catch {}
+    }
+  })
+  $floatingWindow.Add_Closed({
+    $script:FloatingMonitorWindow = $null
+    $script:FloatingStrengthAValue = $null
+    $script:FloatingStrengthBValue = $null
+    $script:FloatingDurationValue = $null
+    $script:FloatingRemainingValue = $null
+    $script:FloatingSourceValue = $null
+    $FloatingMonitorButton.Content = "悬浮监控"
+  })
+  return $floatingWindow
+}
+
+function Toggle-FloatingMonitor {
+  if ($null -ne $script:FloatingMonitorWindow) {
+    $script:FloatingMonitorWindow.Close()
+    return
+  }
+  $script:FloatingMonitorWindow = New-FloatingMonitorWindow
+  Update-FloatingMonitor
+  $FloatingMonitorButton.Content = "关闭悬浮"
+  $script:FloatingMonitorWindow.Show()
 }
 
 function Get-SystemIdleSeconds {
@@ -1387,6 +1507,7 @@ function Set-ActualStrengthState([int]$StrengthA, [int]$StrengthB, [string]$Sour
     $ActualStrengthValue.Text = "A --  |  B --"
   }
   $ActualStrengthSource.Text = $script:State.ActualStrengthSource
+  Update-FloatingMonitor
 }
 
 function Get-RequiredConfigValue($Object, [string]$Name) {
@@ -1424,6 +1545,48 @@ function ConvertTo-ConfigChoice($Value, [string]$Name, [string[]]$Choices) {
     throw "配置字段 $Name 的值无效：$text"
   }
   return $text
+}
+
+function Test-TrustedPlaintextHost([Uri]$Uri) {
+  if ($Uri.IsLoopback) { return $true }
+  $address = $null
+  if (-not [Net.IPAddress]::TryParse($Uri.DnsSafeHost, [ref]$address)) { return $false }
+  $bytes = $address.GetAddressBytes()
+  if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+    return $bytes[0] -eq 10 -or
+      ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
+      ($bytes[0] -eq 192 -and $bytes[1] -eq 168) -or
+      ($bytes[0] -eq 169 -and $bytes[1] -eq 254)
+  }
+  if ($address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+    return [Net.IPAddress]::IsLoopback($address) -or
+      (($bytes[0] -band 0xFE) -eq 0xFC) -or
+      ($bytes[0] -eq 0xFE -and ($bytes[1] -band 0xC0) -eq 0x80)
+  }
+  return $false
+}
+
+function Assert-SecureNetworkEndpoint([string]$Text, [ValidateSet("http", "socket")][string]$Kind) {
+  $label = if ($Kind -eq "http") { "HTTP 桥接地址" } else { "WebSocket 服务器地址" }
+  if ([string]::IsNullOrWhiteSpace($Text)) { throw "$label 不能为空。" }
+  $uri = $null
+  if (-not [Uri]::TryCreate($Text.Trim(), [UriKind]::Absolute, [ref]$uri) -or [string]::IsNullOrWhiteSpace($uri.Host)) {
+    throw "$label 不是有效的绝对 URL。"
+  }
+  if (-not [string]::IsNullOrEmpty($uri.UserInfo)) { throw "$label 不允许在 URL 中携带用户名或密码。" }
+  if (-not [string]::IsNullOrEmpty($uri.Fragment) -or -not [string]::IsNullOrEmpty($uri.Query)) {
+    throw "$label 不允许包含查询参数或片段。"
+  }
+  $secureScheme = if ($Kind -eq "http") { "https" } else { "wss" }
+  $plainScheme = if ($Kind -eq "http") { "http" } else { "ws" }
+  if ($uri.Scheme -eq $secureScheme) { return $uri }
+  if ($uri.Scheme -ne $plainScheme) {
+    throw "$label 必须使用 $secureScheme`://；可信本机或局域网可使用 $plainScheme`://。"
+  }
+  if (-not (Test-TrustedPlaintextHost $uri)) {
+    throw "$plainScheme`:// 明文连接仅允许回环、RFC1918 私有或链路本地 IP；远程地址必须使用 $secureScheme`://。"
+  }
+  return $uri
 }
 
 function Get-DesktopConfiguration {
@@ -1553,6 +1716,9 @@ function Set-DesktopConfiguration($Config, [string]$SourceName) {
   $localHost = ConvertTo-ConfigText (Get-RequiredConfigValue $socket "localHost") "device.socket.localHost" 255
   $localPort = ConvertTo-ConfigInt (Get-RequiredConfigValue $socket "localPort") "device.socket.localPort" 1 65535
   $remoteServer = ConvertTo-ConfigText (Get-RequiredConfigValue $socket "remoteServer") "device.socket.remoteServer" 2048
+  [void](Assert-SecureNetworkEndpoint $httpEndpoint "http")
+  [void](Assert-SecureNetworkEndpoint $remoteServer "socket")
+  [void](Assert-SecureNetworkEndpoint "ws://$localHost`:$localPort" "socket")
   $softLimitA = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "softLimitA") "safety.softLimitA" 0 200
   $softLimitB = ConvertTo-ConfigInt (Get-RequiredConfigValue $safety "softLimitB") "safety.softLimitB" 0 200
   $httpLimitA = if ($safety.PSObject.Properties.Name -contains "httpLimitA") { ConvertTo-ConfigInt $safety.httpLimitA "safety.httpLimitA" 0 200 } else { $softLimitA }
@@ -1912,6 +2078,7 @@ function Update-View {
     $ActualStrengthValue.Text = "A --  |  B --"
   }
   $ActualStrengthSource.Text = $script:State.ActualStrengthSource
+  Update-FloatingMonitor
   if ($script:State.DeviceMode -eq "http") {
     $DeviceValue.Text = if ($script:State.Connected) { "真实桥接已连接" } else { "真实桥接未连接" }
     $DeviceBadge.Text = if ($script:State.Connected) { "真实设备桥接" } else { "真实桥接未连接" }
@@ -2427,8 +2594,7 @@ function Get-PreferredLocalIpv4Address {
   $addresses = [Net.Dns]::GetHostAddresses([Net.Dns]::GetHostName()) | Where-Object {
     $_.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and -not [Net.IPAddress]::IsLoopback($_)
   }
-  $preferred = $addresses | Where-Object { $_.ToString() -match '^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.)' } | Select-Object -First 1
-  if ($null -eq $preferred) { $preferred = $addresses | Select-Object -First 1 }
+  $preferred = $addresses | Where-Object { $_.ToString() -match '^(192\.168\.|10\.|169\.254\.|172\.(1[6-9]|2[0-9]|3[01])\.)' } | Select-Object -First 1
   if ($null -eq $preferred) { return "127.0.0.1" }
   return $preferred.ToString()
 }
@@ -2437,16 +2603,16 @@ function Invoke-LocalSocketStart {
   try {
     Reset-SocketConnection
     $hostText = $LocalSocketHostInput.Text.Trim()
-    if ([string]::IsNullOrWhiteSpace($hostText)) { throw "请填写手机可访问的本机 IP 或域名。" }
     $port = Get-ClampedInt $LocalSocketPortInput 5678 1 65535
+    $advertisedUri = Assert-SecureNetworkEndpoint "ws://$hostText`:$port" "socket"
     $server = New-Object LocalDglabSocketServer
-    $server.Start($port)
+    $server.Start($advertisedUri.DnsSafeHost, $port)
     $script:State.LocalSocketServer = $server
     $script:State.SocketClientId = $server.ClientId
-    $script:State.SocketServerUri = "ws://$hostText`:$port"
+    $script:State.SocketServerUri = $advertisedUri.AbsoluteUri.TrimEnd("/")
     Set-SocketBindingInfo $script:State.SocketServerUri $script:State.SocketClientId
     $SocketBindStatusText.Text = "本地服务器已启动，等待 App 扫码或手动连接"
-    Add-Log "本地 Socket 服务器已启动：0.0.0.0:$port；对外地址 $($script:State.SocketServerUri)"
+    Add-Log "本地 Socket 服务器已安全绑定：$($advertisedUri.DnsSafeHost):$port"
   } catch {
     Reset-SocketConnection
     Add-Log "本地 Socket 服务器启动失败：$($_.Exception.Message)"
@@ -2484,11 +2650,8 @@ function Update-LocalSocketServer {
 function Invoke-RemoteSocketConnect {
   try {
     Reset-SocketConnection
-    $text = $SocketServerInput.Text.Trim().TrimEnd("/")
-    $uri = $null
-    if (-not [Uri]::TryCreate($text, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @("ws", "wss")) {
-      throw "Socket 模式需要 ws:// 或 wss:// 服务器地址，例如 ws://192.168.1.10:5678。"
-    }
+    $uri = Assert-SecureNetworkEndpoint $SocketServerInput.Text "socket"
+    $text = $uri.AbsoluteUri.TrimEnd("/")
     $client = New-Object System.Net.WebSockets.ClientWebSocket
     $connectTimeout = New-Object Threading.CancellationTokenSource 5000
     try {
@@ -2592,10 +2755,8 @@ function Invoke-SocketActivate($Profile) {
 }
 
 function Get-EndpointUrl($Action) {
-  $base = $HttpEndpointInput.Text.Trim().TrimEnd("/")
-  if ([string]::IsNullOrWhiteSpace($base)) {
-    throw "接口地址不能为空"
-  }
+  $baseUri = Assert-SecureNetworkEndpoint $HttpEndpointInput.Text "http"
+  $base = $baseUri.AbsoluteUri.TrimEnd("/")
   if ($base -match "/(activate|stop|status)$") {
     return ($base -replace "/(activate|stop|status)$", "/$Action")
   }
@@ -2812,6 +2973,7 @@ $UnlockButton.Add_Click({
 })
 
 $ManualTestButton.Add_Click({ Invoke-Trigger "手动测试" })
+$FloatingMonitorButton.Add_Click({ Toggle-FloatingMonitor })
 $SocketServerModeCombo.Add_SelectionChanged({
   if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
   if ($SocketServerModeCombo.SelectedIndex -eq 0) {
@@ -3049,9 +3211,17 @@ $timer.Add_Tick({
   Update-View
 })
 
+$floatingMonitorTimer = New-Object Windows.Threading.DispatcherTimer
+$floatingMonitorTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+$floatingMonitorTimer.Add_Tick({ Update-FloatingMonitor })
+
 $window.Add_Closing({
   $timer.Stop()
   $bleOutputTimer.Stop()
+  $floatingMonitorTimer.Stop()
+  if ($null -ne $script:FloatingMonitorWindow) {
+    $script:FloatingMonitorWindow.Close()
+  }
   if ($script:State.Connected) {
     Invoke-DeviceStop | Out-Null
   }
@@ -3059,6 +3229,7 @@ $window.Add_Closing({
 })
 
 $timer.Start()
+$floatingMonitorTimer.Start()
 $LocalSocketHostInput.Text = Get-PreferredLocalIpv4Address
 Initialize-ScopeLists
 Show-AppPage "dashboard"
@@ -3069,6 +3240,26 @@ Update-View
 if ($env:OC_WRITING_FOCUS_SELF_TEST -eq "1") {
   $timer.Stop()
   $bleOutputTimer.Stop()
+  $floatingMonitorTimer.Stop()
+  foreach ($allowedEndpoint in @(
+    @{ Text = "https://device.example.com"; Kind = "http" },
+    @{ Text = "http://127.0.0.1:8080"; Kind = "http" },
+    @{ Text = "http://192.168.1.20:8080"; Kind = "http" },
+    @{ Text = "wss://socket.example.com"; Kind = "socket" },
+    @{ Text = "ws://10.0.0.20:5678"; Kind = "socket" }
+  )) {
+    [void](Assert-SecureNetworkEndpoint $allowedEndpoint.Text $allowedEndpoint.Kind)
+  }
+  foreach ($rejectedEndpoint in @(
+    @{ Text = "http://example.com"; Kind = "http" },
+    @{ Text = "ws://8.8.8.8:5678"; Kind = "socket" },
+    @{ Text = "http://user:password@127.0.0.1:8080"; Kind = "http" },
+    @{ Text = "wss://socket.example.com/connect?token=secret"; Kind = "socket" }
+  )) {
+    $endpointRejected = $false
+    try { [void](Assert-SecureNetworkEndpoint $rejectedEndpoint.Text $rejectedEndpoint.Kind) } catch { $endpointRejected = $true }
+    if (-not $endpointRejected) { throw "不安全网络地址未被拒绝：$($rejectedEndpoint.Text)" }
+  }
   Set-DesktopConfiguration (Get-SafeDesktopConfiguration) "自动测试安全默认值"
   $roundTrip = ((Get-DesktopConfiguration) | ConvertTo-Json -Depth 8 | ConvertFrom-Json)
   Set-DesktopConfiguration $roundTrip "自动测试往返配置"
@@ -3096,6 +3287,23 @@ if ($env:OC_WRITING_FOCUS_SELF_TEST -eq "1") {
   if (-not $invalidRejected) { throw "无效配置未被拒绝" }
   Set-ActualStrengthState 17 23 "自动测试"
   if ($ActualStrengthValue.Text -ne "A 17  |  B 23" -or $ActualStrengthSource.Text -ne "自动测试") { throw "A/B 实际强度显示测试失败" }
+  $script:FloatingMonitorWindow = New-FloatingMonitorWindow
+  Update-FloatingMonitor
+  if ($script:FloatingStrengthAValue.Text -ne "17" -or $script:FloatingStrengthBValue.Text -ne "23" -or $script:FloatingDurationValue.Text -ne "本次持续：2 秒" -or $script:FloatingRemainingValue.Text -ne "剩余时间：未输出") {
+    throw "悬浮监控窗口内容测试失败"
+  }
+  $script:State.OutputActive = $true
+  $script:State.OutputHoldUntilWhitelist = $false
+  $script:State.OutputProfile = @{ DurationMs = 3000 }
+  $script:State.OutputEnd = (Get-Date).AddSeconds(2.5)
+  Update-FloatingMonitor
+  if ($script:FloatingDurationValue.Text -ne "本次持续：3 秒" -or $script:FloatingRemainingValue.Text -notmatch '^剩余时间：[0-9]+\.[0-9] 秒$') {
+    throw "悬浮监控单次持续或剩余时间测试失败"
+  }
+  $script:State.OutputActive = $false
+  $script:State.OutputProfile = $null
+  $script:State.OutputEnd = [DateTime]::MinValue
+  $script:FloatingMonitorWindow.Close()
   $profileLimitTest = @{ AStrength = 90; BStrength = 70 }
   $script:State.DeviceMode = "http"
   $HttpLimitAInput.Text = "20"; $HttpLimitBInput.Text = "30"
