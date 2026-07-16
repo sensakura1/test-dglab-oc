@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$runtimeTypesScript = Join-Path $projectRoot "src\desktop\parts\00-runtime-types.ps1"
+$powershellRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$runtimeTypesScript = Join-Path $powershellRoot "src\desktop\parts\00-runtime-types.ps1"
 $source = Get-Content -Raw $runtimeTypesScript
 $match = [regex]::Match(
   $source,

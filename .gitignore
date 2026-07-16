@@ -5,3 +5,8 @@ logs/*.jsonl
 config/config.json
 .env
 go-app/build/
+csharp/build/
+csharp/**/bin/
+csharp/**/obj/
+powershell/OCWritingFocus.exe
+powershell/app/

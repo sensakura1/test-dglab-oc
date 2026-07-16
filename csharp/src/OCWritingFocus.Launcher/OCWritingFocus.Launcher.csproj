@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>OCWritingFocus</AssemblyName>
+    <RootNamespace>OCWritingFocus.Launcher</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+  <Target Name="RemoveLauncherConfigFromPublish" AfterTargets="Publish">
+    <Delete Files="$(PublishDir)$(AssemblyName).exe.config" />
+  </Target>
+</Project>

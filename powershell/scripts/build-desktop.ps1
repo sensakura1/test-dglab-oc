@@ -1,9 +1,10 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$projectRoot = Split-Path -Parent $PSScriptRoot
-$sourcePath = Join-Path $projectRoot "src\desktop\Program.cs"
-$scriptPath = Join-Path $projectRoot "src\desktop\OCWritingFocusApp.Wpf.ps1"
-$partsSourceDirectory = Join-Path $projectRoot "src\desktop\parts"
+$powershellRoot = Split-Path -Parent $PSScriptRoot
+$projectRoot = Split-Path -Parent $powershellRoot
+$sourcePath = Join-Path $powershellRoot "src\desktop\Program.cs"
+$scriptPath = Join-Path $powershellRoot "src\desktop\OCWritingFocusApp.Wpf.ps1"
+$partsSourceDirectory = Join-Path $powershellRoot "src\desktop\parts"
 $qrCoderPath = Join-Path $projectRoot "vendor\QRCoder\QRCoder.dll"
 $outputDirectory = Join-Path $projectRoot "dist"
 $outputPath = Join-Path $outputDirectory "OCWritingFocus.exe"
@@ -25,7 +26,7 @@ if (-not (Test-Path $qrCoderPath)) {
   throw "未找到二维码组件 vendor\QRCoder\QRCoder.dll。"
 }
 if (-not (Test-Path $partsSourceDirectory -PathType Container)) {
-  throw "未找到桌面程序分片目录 src\desktop\parts。"
+  throw "未找到桌面程序分片目录 powershell\src\desktop\parts。"
 }
 
 New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null

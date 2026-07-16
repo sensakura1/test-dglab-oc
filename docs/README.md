@@ -11,10 +11,12 @@
 
 ## 桌面应用
 
-- 发布程序：`dist/OCWritingFocus.exe`，可直接双击运行，不需要通过 `.ps1` 启动。
-- 启动命令：`npm start` 或 `npm run desktop`，两者都会直接运行 EXE。
-- 重新构建：`npm run build:desktop`，WPF 脚本会作为资源内嵌进 EXE。
-- EXE 宿主源码：[src/desktop/Program.cs](../src/desktop/Program.cs)
+- 主版本：C# + WPF，源码位于 [`csharp/`](../csharp/README.md)，后续功能和 UI 更新默认在 C# 版本完成。
+- 发布程序：`dist/OCWritingFocus.exe`，依赖目录：`dist/OCWritingFocus.dependencies/`。两者同级，运行时不依赖 PowerShell 源码，也不要求目标电脑预装 .NET。
+- 分发时必须同时保留根目录启动 EXE 和完整依赖目录。
+- 开发启动：`npm start` 或 `npm run desktop`。
+- 获得发布确认后构建：`npm run build:desktop`。
+- 旧 PowerShell 版本位于 [`powershell/`](../powershell/README.md)，通过 `npm run desktop:powershell` 启动。
 - 设备模式：HTTP 真实设备桥接、蓝牙 V3 直连。HTTP 桥接模式保留，用于连接已有本地郊狼桥接服务。
 - 范围规则：参考 OBS 的窗口选择方式，先刷新当前可见窗口列表，再选择具体窗口加入白名单或黑名单；黑名单命中直接触发，白名单不处罚，未命中两者时按常规离开时间规则触发。
 - 窗口检测：桌面端调用 Windows `EnumWindows`、`GetForegroundWindow`、`GetWindowText` 和 `GetWindowThreadProcessId` 读取窗口列表、当前前台窗口标题与进程名进行判定。

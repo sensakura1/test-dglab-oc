@@ -1,7 +1,7 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$desktopScript = Join-Path $projectRoot "src\desktop\OCWritingFocusApp.Wpf.ps1"
+$powershellRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$desktopScript = Join-Path $powershellRoot "src\desktop\OCWritingFocusApp.Wpf.ps1"
 $previousSelfTest = $env:OC_WRITING_FOCUS_SELF_TEST
 try {
   $env:OC_WRITING_FOCUS_SELF_TEST = "1"

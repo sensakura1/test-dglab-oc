@@ -1,0 +1,29 @@
+<Window x:Class="OCWritingFocus.Wpf.ChannelMonitorWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="A/B 强度监控" Width="330" Height="190" MinWidth="330" MinHeight="190"
+        WindowStyle="SingleBorderWindow" ResizeMode="CanResize" ShowInTaskbar="True" Topmost="True"
+        WindowStartupLocation="CenterScreen" Background="#202020">
+  <Border Background="#202020" BorderBrush="#2D8CFF" BorderThickness="1" CornerRadius="4" Padding="14">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <TextBlock Text="A/B 通道实时监控" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontSize="15" FontWeight="Bold"/>
+      <Grid Grid.Row="1" Margin="0,10,0,8">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <Border Background="#303030" CornerRadius="3" Padding="12" Margin="0,0,6,0">
+          <StackPanel><TextBlock Text="通道 A" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI"/><TextBlock x:Name="FloatingStrengthAValue" Text="--" Foreground="#66B3FF" FontFamily="Microsoft YaHei UI" FontSize="28" FontWeight="Bold" HorizontalAlignment="Center"/></StackPanel>
+        </Border>
+        <Border Grid.Column="1" Background="#303030" CornerRadius="3" Padding="12" Margin="6,0,0,0">
+          <StackPanel><TextBlock Text="通道 B" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI"/><TextBlock x:Name="FloatingStrengthBValue" Text="--" Foreground="#66B3FF" FontFamily="Microsoft YaHei UI" FontSize="28" FontWeight="Bold" HorizontalAlignment="Center"/></StackPanel>
+        </Border>
+      </Grid>
+      <Grid Grid.Row="2">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <TextBlock x:Name="FloatingDurationValue" Text="本次持续：5 秒" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontWeight="Bold"/>
+        <TextBlock x:Name="FloatingRemainingValue" Grid.Column="1" Text="剩余时间：未输出" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontWeight="Bold" HorizontalAlignment="Right"/>
+      </Grid>
+      <TextBlock x:Name="FloatingSourceValue" Grid.Row="3" Text="未连接" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI" FontSize="10" TextTrimming="CharacterEllipsis" Margin="0,7,0,0"/>
+    </Grid>
+  </Border>
+</Window>

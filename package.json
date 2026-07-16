@@ -6,9 +6,13 @@
   "description": "Local OC writing focus helper with configurable Coyote device triggers.",
   "scripts": {
     "start": "npm run desktop",
-    "build:desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-desktop.ps1",
-    "desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File src\\desktop\\OCWritingFocusApp.Wpf.ps1",
-    "test": "node --test tests/**/*.test.js && powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\\desktop\\localSocketServer.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\\desktop\\configAndTimer.test.ps1"
+    "desktop": "dotnet run --project csharp\\src\\OCWritingFocus.Wpf\\OCWritingFocus.Wpf.csproj",
+    "desktop:powershell": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File powershell\\src\\desktop\\OCWritingFocusApp.Wpf.ps1",
+    "build:desktop": "dotnet publish csharp\\src\\OCWritingFocus.Wpf\\OCWritingFocus.Wpf.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o dist\\OCWritingFocus.dependencies && dotnet publish csharp\\src\\OCWritingFocus.Launcher\\OCWritingFocus.Launcher.csproj -c Release -p:DebugType=None -p:DebugSymbols=false -o dist",
+    "build:desktop:powershell": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File powershell\\scripts\\build-desktop.ps1",
+    "test:csharp": "dotnet run --project csharp\\tests\\OCWritingFocus.Core.Tests\\OCWritingFocus.Core.Tests.csproj",
+    "test:powershell": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File powershell\\tests\\desktop\\localSocketServer.test.ps1 && powershell.exe -NoProfile -ExecutionPolicy Bypass -File powershell\\tests\\desktop\\configAndTimer.test.ps1",
+    "test": "node --test tests/**/*.test.js && npm run test:csharp && npm run test:powershell"
   },
   "engines": {
     "node": ">=22"
