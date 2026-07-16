@@ -14,6 +14,7 @@ namespace OCWritingFocus
         private const string AppDirectoryName = "app";
         private const string ScriptFileName = "OCWritingFocusApp.Wpf.ps1";
         private const string QrCoderFileName = "QRCoder.dll";
+        private const string DesktopRootEnvironmentVariable = "OC_WRITING_FOCUS_DESKTOP_ROOT";
 
         [STAThread]
         private static void Main()
@@ -94,6 +95,10 @@ namespace OCWritingFocus
                     "未找到桌面程序脚本，请确保 app 文件夹与 EXE 一起分发。",
                     scriptPath);
             }
+
+            Environment.SetEnvironmentVariable(
+                DesktopRootEnvironmentVariable,
+                Path.GetDirectoryName(scriptPath));
 
             using (StreamReader reader = new StreamReader(scriptPath, Encoding.UTF8, true))
             {

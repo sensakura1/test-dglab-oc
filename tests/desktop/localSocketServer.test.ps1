@@ -1,8 +1,8 @@
 ﻿$ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$desktopScript = Join-Path $projectRoot "src\desktop\OCWritingFocusApp.Wpf.ps1"
-$source = Get-Content -Raw $desktopScript
+$runtimeTypesScript = Join-Path $projectRoot "src\desktop\parts\00-runtime-types.ps1"
+$source = Get-Content -Raw $runtimeTypesScript
 $match = [regex]::Match(
   $source,
   '-TypeDefinition @"\r?\n(?<code>.*?)\r?\n"@',
