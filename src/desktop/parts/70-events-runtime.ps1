@@ -72,6 +72,7 @@ $UnlockButton.Add_Click({
 
 $ManualTestButton.Add_Click({ Invoke-Trigger "手动测试" })
 $FloatingMonitorButton.Add_Click({ Toggle-FloatingMonitor })
+$FloatingWindowMonitorButton.Add_Click({ Toggle-FloatingWindowMonitor })
 $SocketServerModeCombo.Add_SelectionChanged({
   if ($null -ne $script:State.SocketClient -or $null -ne $script:State.LocalSocketServer) { Reset-SocketConnection }
   if ($SocketServerModeCombo.SelectedIndex -eq 0) {
@@ -319,6 +320,9 @@ $window.Add_Closing({
   $floatingMonitorTimer.Stop()
   if ($null -ne $script:FloatingMonitorWindow) {
     $script:FloatingMonitorWindow.Close()
+  }
+  if ($null -ne $script:FloatingWindowMonitorWindow) {
+    $script:FloatingWindowMonitorWindow.Close()
   }
   if ($script:State.Connected) {
     Invoke-DeviceStop | Out-Null

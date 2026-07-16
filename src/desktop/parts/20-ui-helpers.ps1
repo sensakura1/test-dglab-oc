@@ -46,8 +46,8 @@ function New-FloatingMonitorWindow {
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="A/B 强度监控" Width="330" Height="190" MinWidth="330" MinHeight="190"
-        WindowStyle="ToolWindow" ResizeMode="NoResize" ShowInTaskbar="False" Topmost="True"
-        WindowStartupLocation="CenterOwner" Background="#202020">
+        WindowStyle="SingleBorderWindow" ResizeMode="CanResize" ShowInTaskbar="True" Topmost="True"
+        WindowStartupLocation="CenterScreen" Background="#202020">
   <Border Background="#202020" BorderBrush="#2D8CFF" BorderThickness="1" CornerRadius="4" Padding="14">
     <Grid>
       <Grid.RowDefinitions>
@@ -75,18 +75,11 @@ function New-FloatingMonitorWindow {
 "@
   $reader = New-Object Xml.XmlNodeReader ([xml]$floatingXaml)
   $floatingWindow = [Windows.Markup.XamlReader]::Load($reader)
-  if ($window.IsVisible) { $floatingWindow.Owner = $window }
   $script:FloatingStrengthAValue = $floatingWindow.FindName("FloatingStrengthAValue")
   $script:FloatingStrengthBValue = $floatingWindow.FindName("FloatingStrengthBValue")
   $script:FloatingDurationValue = $floatingWindow.FindName("FloatingDurationValue")
   $script:FloatingRemainingValue = $floatingWindow.FindName("FloatingRemainingValue")
   $script:FloatingSourceValue = $floatingWindow.FindName("FloatingSourceValue")
-  $floatingWindow.Add_MouseLeftButtonDown({
-    param($sender, $eventArgs)
-    if ($eventArgs.ButtonState -eq [Windows.Input.MouseButtonState]::Pressed) {
-      try { $sender.DragMove() } catch {}
-    }
-  })
   $floatingWindow.Add_Closed({
     $script:FloatingMonitorWindow = $null
     $script:FloatingStrengthAValue = $null
@@ -94,7 +87,7 @@ function New-FloatingMonitorWindow {
     $script:FloatingDurationValue = $null
     $script:FloatingRemainingValue = $null
     $script:FloatingSourceValue = $null
-    $FloatingMonitorButton.Content = "悬浮监控"
+    $FloatingMonitorButton.Content = "通道悬浮"
   })
   return $floatingWindow
 }
@@ -106,8 +99,64 @@ function Toggle-FloatingMonitor {
   }
   $script:FloatingMonitorWindow = New-FloatingMonitorWindow
   Update-FloatingMonitor
-  $FloatingMonitorButton.Content = "关闭悬浮"
+  $FloatingMonitorButton.Content = "关闭通道"
   $script:FloatingMonitorWindow.Show()
+}
+
+function Update-FloatingWindowMonitor {
+  if ($null -eq $script:FloatingWindowMonitorWindow) { return }
+  $script:FloatingWindowDisplayValue.Text = $CurrentWindowInput.Text
+  $script:FloatingWindowMatchValue.Text = $CurrentWindowMatchValue.Text
+}
+
+function New-FloatingWindowMonitorWindow {
+  $floatingXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="当前窗口监控" Width="460" Height="210" MinWidth="360" MinHeight="190"
+        WindowStyle="SingleBorderWindow" ResizeMode="CanResize" ShowInTaskbar="True" Topmost="True"
+        WindowStartupLocation="CenterScreen" Background="#202020">
+  <Border Background="#202020" BorderBrush="#2D8CFF" BorderThickness="1" CornerRadius="4" Padding="14">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/>
+      </Grid.RowDefinitions>
+      <TextBlock Text="Windows 前台窗口实时监控" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontSize="15" FontWeight="Bold"/>
+      <Border Grid.Row="1" Background="#303030" CornerRadius="3" Padding="12" Margin="0,10,0,8">
+        <TextBlock x:Name="FloatingWindowDisplayValue" Text="等待检测..." Foreground="#66B3FF" FontFamily="Microsoft YaHei UI" FontSize="16" FontWeight="Bold" TextWrapping="Wrap" VerticalAlignment="Center"/>
+      </Border>
+      <Grid Grid.Row="2">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <TextBlock Text="范围判定：" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI"/>
+        <TextBlock x:Name="FloatingWindowMatchValue" Grid.Column="1" Text="未匹配" Foreground="#E8E8E8" FontFamily="Microsoft YaHei UI" FontWeight="Bold"/>
+        <TextBlock Grid.Column="2" Text="每 1 秒刷新" Foreground="#A0A0A0" FontFamily="Microsoft YaHei UI" FontSize="10"/>
+      </Grid>
+    </Grid>
+  </Border>
+</Window>
+"@
+  $reader = New-Object Xml.XmlNodeReader ([xml]$floatingXaml)
+  $floatingWindow = [Windows.Markup.XamlReader]::Load($reader)
+  $script:FloatingWindowDisplayValue = $floatingWindow.FindName("FloatingWindowDisplayValue")
+  $script:FloatingWindowMatchValue = $floatingWindow.FindName("FloatingWindowMatchValue")
+  $floatingWindow.Add_Closed({
+    $script:FloatingWindowMonitorWindow = $null
+    $script:FloatingWindowDisplayValue = $null
+    $script:FloatingWindowMatchValue = $null
+    $FloatingWindowMonitorButton.Content = "窗口悬浮"
+  })
+  return $floatingWindow
+}
+
+function Toggle-FloatingWindowMonitor {
+  if ($null -ne $script:FloatingWindowMonitorWindow) {
+    $script:FloatingWindowMonitorWindow.Close()
+    return
+  }
+  $script:FloatingWindowMonitorWindow = New-FloatingWindowMonitorWindow
+  Update-FloatingWindowMonitor
+  $FloatingWindowMonitorButton.Content = "关闭窗口"
+  $script:FloatingWindowMonitorWindow.Show()
 }
 
 function Get-SystemIdleSeconds {

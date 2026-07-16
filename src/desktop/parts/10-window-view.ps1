@@ -288,7 +288,8 @@
              <Border x:Name="LockBadgeBorder" Background="#25384A" CornerRadius="3" Padding="10,5" Margin="0,0,8,0">
                <TextBlock x:Name="LockBadge" Text="未锁定" Foreground="#66B3FF" FontWeight="Bold"/>
              </Border>
-            <Button x:Name="FloatingMonitorButton" Style="{StaticResource SecondaryButton}" Content="悬浮监控" Width="94" Height="34" Margin="0,0,8,0"/>
+            <Button x:Name="FloatingMonitorButton" Style="{StaticResource SecondaryButton}" Content="通道悬浮" Width="94" Height="34" Margin="0,0,8,0"/>
+            <Button x:Name="FloatingWindowMonitorButton" Style="{StaticResource SecondaryButton}" Content="窗口悬浮" Width="94" Height="34" Margin="0,0,8,0"/>
             <Button x:Name="EmergencyButton" Style="{StaticResource DangerButton}" Content="急停" Width="86" Height="34" FontWeight="Bold"/>
           </StackPanel>
         </Grid>

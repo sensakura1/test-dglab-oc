@@ -4,3 +4,4 @@ coverage/
 logs/*.jsonl
 config/config.json
 .env
+go-app/build/

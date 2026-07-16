@@ -49,6 +49,12 @@
   Set-ActualStrengthState 17 23 "自动测试"
   if ($ActualStrengthValue.Text -ne "A 17  |  B 23" -or $ActualStrengthSource.Text -ne "自动测试") { throw "A/B 实际强度显示测试失败" }
   $script:FloatingMonitorWindow = New-FloatingMonitorWindow
+  if ($script:FloatingMonitorWindow.ResizeMode -ne [Windows.ResizeMode]::CanResize -or
+      -not $script:FloatingMonitorWindow.ShowInTaskbar -or
+      $null -ne $script:FloatingMonitorWindow.Owner -or
+      $script:FloatingMonitorWindow.WindowStartupLocation -ne [Windows.WindowStartupLocation]::CenterScreen) {
+    throw "悬浮监控窗口未配置为可调整大小的独立窗口"
+  }
   Update-FloatingMonitor
   if ($script:FloatingStrengthAValue.Text -ne "17" -or $script:FloatingStrengthBValue.Text -ne "23" -or $script:FloatingDurationValue.Text -ne "本次持续：2 秒" -or $script:FloatingRemainingValue.Text -ne "剩余时间：未输出") {
     throw "悬浮监控窗口内容测试失败"
@@ -65,6 +71,18 @@
   $script:State.OutputProfile = $null
   $script:State.OutputEnd = [DateTime]::MinValue
   $script:FloatingMonitorWindow.Close()
+  $CurrentWindowInput.Text = "Code | OC 设定.md - Visual Studio Code"
+  $CurrentWindowMatchValue.Text = "白名单"
+  $script:FloatingWindowMonitorWindow = New-FloatingWindowMonitorWindow
+  Update-FloatingWindowMonitor
+  if ($script:FloatingWindowMonitorWindow.ResizeMode -ne [Windows.ResizeMode]::CanResize -or
+      -not $script:FloatingWindowMonitorWindow.ShowInTaskbar -or
+      $null -ne $script:FloatingWindowMonitorWindow.Owner -or
+      $script:FloatingWindowDisplayValue.Text -ne $CurrentWindowInput.Text -or
+      $script:FloatingWindowMatchValue.Text -ne "白名单") {
+    throw "当前窗口悬浮监控测试失败"
+  }
+  $script:FloatingWindowMonitorWindow.Close()
   $profileLimitTest = @{ AStrength = 90; BStrength = 70 }
   $script:State.DeviceMode = "http"
   $HttpLimitAInput.Text = "20"; $HttpLimitBInput.Text = "30"

@@ -92,6 +92,7 @@ $UnlockButton = Find-Control "UnlockButton"
 $EmergencyButton = Find-Control "EmergencyButton"
 $ManualTestButton = Find-Control "ManualTestButton"
 $FloatingMonitorButton = Find-Control "FloatingMonitorButton"
+$FloatingWindowMonitorButton = Find-Control "FloatingWindowMonitorButton"
 $ConnectButton = Find-Control "ConnectButton"
 $ApplySafetyButton = Find-Control "ApplySafetyButton"
 $DisconnectButton = Find-Control "DisconnectButton"
@@ -153,4 +154,7 @@ $script:FloatingStrengthBValue = $null
 $script:FloatingDurationValue = $null
 $script:FloatingRemainingValue = $null
 $script:FloatingSourceValue = $null
+$script:FloatingWindowMonitorWindow = $null
+$script:FloatingWindowDisplayValue = $null
+$script:FloatingWindowMatchValue = $null
 

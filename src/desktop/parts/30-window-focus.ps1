@@ -173,6 +173,7 @@ function Refresh-CurrentWindow {
   } else {
     $CurrentWindowMatchValue.Text = "未匹配"
   }
+  Update-FloatingWindowMonitor
   return $info.Display
 }
 
